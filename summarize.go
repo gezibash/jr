@@ -140,9 +140,9 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 }
 
 // summarizeByDay gets each day's summary (saved or new, 4 days at a time)
-// and combines them. Summarizing 1,512 entries in 40,000-character parts
-// made Gemma list them nearly one by one and hit its 4,000-token limit in 2
-// of 5 parts; a day at a time keeps every call small.
+// and writes a short overview citing them. Summarizing 1,512 entries in
+// 40,000-character parts made Gemma list them nearly one by one and hit its
+// 4,000-token limit in 2 of 5 parts; a day at a time keeps every call small.
 func summarizeByDay(s *Store, ai *AI, g gitInfo, f Filter, refresh bool, entries []Entry, days []string) (string, error) {
 	fmt.Fprintf(os.Stderr, "jr: summarizing %d entries day by day (%d days)\n", len(entries), len(days))
 	sums, errs := make([]*Entry, len(days)), make([]error, len(days))
@@ -165,45 +165,67 @@ func summarizeByDay(s *Store, ai *AI, g gitInfo, f Filter, refresh bool, entries
 			return "", err
 		}
 	}
-	// Day summaries cite entry IDs; turn them back into this period's entry
-	// numbers so the model never copies IDs.
-	num := map[string]int{}
-	for n, e := range entries {
-		num[e.ID[:shortIDLen]] = n + 1
-	}
-	var parts []string
+	// The period summary is a short overview that cites day summaries; the
+	// day summaries cite entries. Asked to merge the days' entry-level detail
+	// instead, Gemma listed all ~1,500 facts of a busy week and ran past
+	// 4,000 and then 8,000 tokens.
+	var parts, footer []string
+	var dayIDs []string
 	for i, sum := range sums {
 		if sum == nil {
 			continue
 		}
+		dayIDs = append(dayIDs, sum.ID[:shortIDLen])
 		body, _, _ := strings.Cut(sum.Body, "\n\n_Covers ")
-		body = reCiteGroup.ReplaceAllStringFunc(body, func(group string) string {
-			var ns []string
-			for _, it := range strings.Split(group[1:len(group)-1], ",") {
-				if n, ok := num[strings.TrimSpace(it)]; ok {
-					ns = append(ns, strconv.Itoa(n))
-				}
-			}
-			if len(ns) == 0 {
-				return group
-			}
-			return "[" + strings.Join(ns, ", ") + "]"
-		})
-		parts = append(parts, "Day "+days[i]+":\n"+body)
+		body = reCiteGroup.ReplaceAllString(body, "") // entry citations stay in the day summary
+		parts = append(parts, fmt.Sprintf("D%d (%s):\n%s", len(dayIDs), days[i], body))
+		footer = append(footer, fmt.Sprintf("%s [%s]", days[i], sum.ID[:shortIDLen]))
 	}
-	prompt := "Combine these daily summaries of one period into one summary of the whole period, keeping the [number] citations. " +
-		summaryRules + "\n\n" + strings.Join(parts, "\n\n---\n\n")
-	// A week combined from 7 busy days ran past 4,000 tokens and lost its
-	// last sections.
-	out, err := ai.chat(prompt, 8000)
+	prompt := "Write a short overview of this period for a teammate catching up, from the daily summaries below. " +
+		"Use at most 15 bullets in total, under the headings Themes, Decisions, Problems and fixes, and Still open; " +
+		"skip a heading with nothing under it. End each bullet with the days it draws on, like [D2, D5]. " +
+		"Say nothing that isn't in the summaries. No preamble.\n\n" + strings.Join(parts, "\n\n---\n\n")
+	out, err := ai.chat(prompt, 2000)
 	if err != nil {
 		return "", err
 	}
-	out, dropped := citeIDs(out, entries)
+	out, dropped := citeDays(out, dayIDs)
 	if dropped > 0 {
-		fmt.Fprintf(os.Stderr, "jr: removed %d citations that match no entry in the period\n", dropped)
+		fmt.Fprintf(os.Stderr, "jr: removed %d citations that match no day\n", dropped)
 	}
-	return out, nil
+	return out + "\n\nDetails by day: " + strings.Join(footer, ", ") + ".", nil
+}
+
+var reDayList = regexp.MustCompile(`^\s*D\d+(\s*[,;]\s*D\d+)*\s*$`)
+
+// citeDays turns [D2, D5] into the IDs of those days' summaries, at most 5
+// per bullet, dropping days that don't exist.
+func citeDays(text string, dayIDs []string) (string, int) {
+	dropped := 0
+	out := reCiteGroup.ReplaceAllStringFunc(text, func(group string) string {
+		inner := group[1 : len(group)-1]
+		if !reDayList.MatchString(inner) {
+			return group
+		}
+		var keep []string
+		seen := map[int]bool{}
+		for _, f := range strings.FieldsFunc(inner, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
+			n, err := strconv.Atoi(strings.TrimPrefix(f, "D"))
+			if err != nil || n < 1 || n > len(dayIDs) {
+				dropped++
+				continue
+			}
+			if !seen[n] && len(keep) < maxCitesPerBullet {
+				seen[n] = true
+				keep = append(keep, dayIDs[n-1])
+			}
+		}
+		if len(keep) == 0 {
+			return ""
+		}
+		return "[" + strings.Join(keep, ", ") + "]"
+	})
+	return out, dropped
 }
 
 // summaryKey names a summary by the absolute period and filters it covers,

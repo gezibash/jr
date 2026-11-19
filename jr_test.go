@@ -141,6 +141,18 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} `json:"messages"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
+		if prompt, ok := req.Messages[0].Content.(string); ok && strings.HasPrefix(prompt, "Write a short overview") {
+			// Overview of a long period: one bullet per day it was given,
+			// plus a day that doesn't exist, which jr must drop.
+			f.summaryCalls.Add(1)
+			var lines []string
+			for _, m := range regexp.MustCompile(`(?m)^D(\d+) \(`).FindAllStringSubmatch(prompt, -1) {
+				lines = append(lines, "- theme [D"+m[1]+"]")
+			}
+			lines = append(lines, "- invented [D99]")
+			reply(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": strings.Join(lines, "\n")}}}})
+			return
+		}
 		if prompt, ok := req.Messages[0].Content.(string); ok && (strings.HasPrefix(prompt, "Summarize") || strings.HasPrefix(prompt, "Combine")) {
 			// Summaries: one bullet citing every [ID] the prompt contains,
 			// so a test can see whether any entry was dropped.
@@ -839,9 +851,10 @@ func TestSummarize(t *testing.T) {
 	}
 }
 
-// A long period is built from day summaries: no entry may be lost, the day
-// summaries are saved, and an entry added later redoes only its own day and
-// the final combine.
+// A long period gets a short overview citing its day summaries, which cite
+// the entries: following the citations reaches every entry. Day summaries
+// are saved, and an entry added later redoes only its own day and the
+// overview.
 func TestSummarizeLongPeriodByDay(t *testing.T) {
 	e := newEnv(t)
 	body := strings.Repeat("Investigated the export worker and tuned its batch size. ", 9)
@@ -850,29 +863,44 @@ func TestSummarizeLongPeriodByDay(t *testing.T) {
 		all = append(all, firstID(e.must(body, "add", "--at", fmt.Sprintf("2026-11-%02dT10:%02d:00+01:00", 9+i%7, i%60))))
 	}
 	out := e.must("", "summarize", "--on", "last week")
+	if n := e.ai.summaryCalls.Load(); n != 8 {
+		t.Errorf("want 7 day summaries + 1 overview = 8 calls, made %d", n)
+	}
+	if !strings.Contains(out, "Covers 120 entries") || !strings.Contains(out, "Details by day: 2026-11-09 [") || strings.Contains(out, "D99") {
+		t.Errorf("overview should cover 120 entries, list the days, and drop an invented day:\n%s", out)
+	}
+	days := regexp.MustCompile(`\d{4}-\d\d-\d\d \[([0-9A-Z]{14})\]`).FindAllStringSubmatch(out, -1)
+	if len(days) != 7 {
+		t.Fatalf("want 7 day summaries linked, got %d:\n%s", len(days), out)
+	}
+	var detail strings.Builder
+	for _, d := range days {
+		if !strings.Contains(out, "- theme ["+d[1]+"]") {
+			t.Errorf("overview bullet should cite day summary %s", d[1])
+		}
+		detail.WriteString(e.must("", "show", d[1]))
+	}
 	missing := 0
 	for _, id := range all {
-		if !strings.Contains(out, id[:14]) {
+		if !strings.Contains(detail.String(), id[:14]) {
 			missing++
 		}
 	}
-	if missing > 0 || !strings.Contains(out, "Covers 120 entries") {
-		t.Errorf("%d of 120 entries missing from the summary", missing)
-	}
-	if n := e.ai.summaryCalls.Load(); n != 8 {
-		t.Errorf("want 7 day summaries + 1 combine = 8 calls, made %d", n)
-	}
-	if got := ids(e.must("", "list", "--kind", "summary", "--limit", "100")); len(got) != 8 {
-		t.Errorf("want 7 day summaries and 1 week summary saved, got %d", len(got))
+	if missing > 0 {
+		t.Errorf("%d of 120 entries can't be reached from the overview through its day summaries", missing)
 	}
 
 	calls := e.ai.summaryCalls.Load()
 	late := firstID(e.must("Found the export leak.", "add", "--at", "2026-11-12T18:00:00+01:00"))
 	out = e.must("", "summarize", "--on", "last week")
 	if n := e.ai.summaryCalls.Load() - calls; n != 2 {
-		t.Errorf("an entry added to one day should redo that day and the combine (2 calls), made %d", n)
+		t.Errorf("an entry added to one day should redo that day and the overview (2 calls), made %d", n)
 	}
-	if !strings.Contains(out, late[:14]) || !strings.Contains(out, "Covers 121 entries") {
-		t.Errorf("the late entry is missing from the redone summary")
+	if !strings.Contains(out, "Covers 121 entries") {
+		t.Errorf("the redone overview should count the late entry:\n%s", out)
+	}
+	day12 := regexp.MustCompile(`2026-11-12 \[([0-9A-Z]{14})\]`).FindStringSubmatch(out)
+	if day12 == nil || !strings.Contains(e.must("", "show", day12[1]), late[:14]) {
+		t.Errorf("the late entry should be cited in the redone day summary")
 	}
 }
