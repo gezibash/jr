@@ -37,6 +37,18 @@ Each optional part adds more. Turn them on in any order, whenever you like:
 `jr doctor` shows which parts are on and how to turn on the rest. After
 turning one on, `jr reindex` indexes everything saved before.
 
+Measured on 20,000 entries spread over 3 months, with 30 test questions:
+
+| | No setup | With Ollama and Workers AI |
+|---|---|---|
+| Question with the entry's own words: right entry first | 30 of 30 | 30 of 30 |
+| Question in other words: right entry first | 8 of 30 | 21 of 30 |
+| Search time, median / slowest 5% | 0.06 s / 0.07 s | 1.1 s / 4.2 s |
+| Adds per second, 16 sessions at once | 156 | 58 |
+
+The reworded questions avoid the entry's words on purpose, so they are the
+hard case. Search by meaning is what closes that gap.
+
 ## Use
 
 ```bash
