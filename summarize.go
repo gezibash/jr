@@ -47,9 +47,27 @@ func cmdSummarize(args []string) error {
 	if err := resolveFilter(s, f); err != nil {
 		return err
 	}
-	all, err := s.List(*f, 1_000_000, true)
+	ai, _ := NewAI()
+	sum, err := summarizeFilter(s, ai, g, *f, *refresh)
 	if err != nil {
 		return err
+	}
+	if sum == nil {
+		fmt.Println("No entries in that period.")
+		return nil
+	}
+	printEntry(*sum)
+	return nil
+}
+
+// summarizeFilter returns the saved summary of the entries matching f,
+// writing it first if it is missing or an entry was added since. A period of
+// several days that is too long for one call is built from day summaries,
+// which are saved too and reused by later weeks and months.
+func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entry, error) {
+	all, err := s.List(f, 1_000_000, true)
+	if err != nil {
+		return nil, err
 	}
 	var entries []Entry
 	for _, e := range all {
@@ -58,12 +76,11 @@ func cmdSummarize(args []string) error {
 		}
 	}
 	if len(entries) == 0 {
-		fmt.Println("No entries in that period.")
-		return nil
+		return nil, nil
 	}
-	key, err := summaryKey(*f)
+	key, err := summaryKey(f)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Reuse the saved summary unless an entry was added after it. IDs sort
@@ -73,24 +90,38 @@ func cmdSummarize(args []string) error {
 	for _, e := range entries {
 		newest = max(newest, e.ID)
 	}
-	old, _ := s.List(Filter{Kind: "summary"}, 1_000_000, false)
+	old, err := s.List(Filter{Kind: "summary"}, 1_000_000, false)
+	if err != nil {
+		return nil, err
+	}
 	for _, o := range old {
 		if o.Title != key {
 			continue
 		}
-		if o.ID > newest && !*refresh {
-			printEntry(o)
-			return nil
+		if o.ID > newest && !refresh {
+			return &o, nil
 		}
 		if err := s.Delete(o.ID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	ai, _ := NewAI()
-	body, err := summarizeEntries(ai, entries)
+	size := 0
+	var days []string
+	for n, e := range entries {
+		size += len(entryLine(n, e)) + 1
+		if d := localTime(e.TS)[:10]; len(days) == 0 || days[len(days)-1] != d {
+			days = append(days, d)
+		}
+	}
+	var body string
+	if len(days) > 1 && size > summaryPartChars {
+		body, err = summarizeByDay(s, ai, g, f, refresh, entries, days)
+	} else {
+		body, err = summarizeEntries(ai, entries)
+	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	first, last := localTime(entries[0].TS), localTime(entries[len(entries)-1].TS)
 	sum := Entry{
@@ -99,17 +130,80 @@ func cmdSummarize(args []string) error {
 		Title: key, Body: fmt.Sprintf("%s\n\n_Covers %d entries, %s → %s._", body, len(entries), first, last),
 	}
 	if err := s.Insert(sum, []Chunk{{Modality: "text"}}); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := process(s, ai, sum.ID); err != nil {
-		return err
+		return nil, err
 	}
 	saved, err := s.Get(sum.ID)
-	if err != nil {
-		return err
+	return &saved, err
+}
+
+// summarizeByDay gets each day's summary (saved or new, 4 days at a time)
+// and combines them. Summarizing 1,512 entries in 40,000-character parts
+// made Gemma list them nearly one by one and hit its 4,000-token limit in 2
+// of 5 parts; a day at a time keeps every call small.
+func summarizeByDay(s *Store, ai *AI, g gitInfo, f Filter, refresh bool, entries []Entry, days []string) (string, error) {
+	fmt.Fprintf(os.Stderr, "jr: summarizing %d entries day by day (%d days)\n", len(entries), len(days))
+	sums, errs := make([]*Entry, len(days)), make([]error, len(days))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, d := range days {
+		wg.Add(1)
+		go func(i int, d string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			df := f
+			df.Since, df.Until, df.On = "", "", d
+			sums[i], errs[i] = summarizeFilter(s, ai, g, df, refresh)
+		}(i, d)
 	}
-	printEntry(saved)
-	return nil
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return "", err
+		}
+	}
+	// Day summaries cite entry IDs; turn them back into this period's entry
+	// numbers so the model never copies IDs.
+	num := map[string]int{}
+	for n, e := range entries {
+		num[e.ID[:shortIDLen]] = n + 1
+	}
+	var parts []string
+	for i, sum := range sums {
+		if sum == nil {
+			continue
+		}
+		body, _, _ := strings.Cut(sum.Body, "\n\n_Covers ")
+		body = reCiteGroup.ReplaceAllStringFunc(body, func(group string) string {
+			var ns []string
+			for _, it := range strings.Split(group[1:len(group)-1], ",") {
+				if n, ok := num[strings.TrimSpace(it)]; ok {
+					ns = append(ns, strconv.Itoa(n))
+				}
+			}
+			if len(ns) == 0 {
+				return group
+			}
+			return "[" + strings.Join(ns, ", ") + "]"
+		})
+		parts = append(parts, "Day "+days[i]+":\n"+body)
+	}
+	prompt := "Combine these daily summaries of one period into one summary of the whole period, keeping the [number] citations. " +
+		summaryRules + "\n\n" + strings.Join(parts, "\n\n---\n\n")
+	// A week combined from 7 busy days ran past 4,000 tokens and lost its
+	// last sections.
+	out, err := ai.chat(prompt, 8000)
+	if err != nil {
+		return "", err
+	}
+	out, dropped := citeIDs(out, entries)
+	if dropped > 0 {
+		fmt.Fprintf(os.Stderr, "jr: removed %d citations that match no entry in the period\n", dropped)
+	}
+	return out, nil
 }
 
 // summaryKey names a summary by the absolute period and filters it covers,
@@ -164,16 +258,7 @@ func summarizeEntries(ai *AI, entries []Entry) (string, error) {
 	var parts []string
 	var cur strings.Builder
 	for n, e := range entries {
-		line := fmt.Sprintf("[%d] %s %s", n+1, localTime(e.TS), e.Kind)
-		if e.Status != "" {
-			line += " (" + e.Status + ")"
-		}
-		line += ": " + truncate(oneLine(e.Body), 600)
-		for _, a := range e.Assets {
-			if a.Description != "" {
-				line += " | attachment: " + truncate(oneLine(a.Description), 200)
-			}
-		}
+		line := entryLine(n, e)
 		if cur.Len()+len(line) > summaryPartChars && cur.Len() > 0 {
 			parts = append(parts, cur.String())
 			cur.Reset()
@@ -255,4 +340,20 @@ func citeIDs(text string, entries []Entry) (string, int) {
 		return "[" + strings.Join(keep, ", ") + "]"
 	})
 	return out, dropped
+}
+
+// entryLine is how an entry is shown to the summarizer: its number, time,
+// kind, status, text and attachment descriptions.
+func entryLine(n int, e Entry) string {
+	line := fmt.Sprintf("[%d] %s %s", n+1, localTime(e.TS), e.Kind)
+	if e.Status != "" {
+		line += " (" + e.Status + ")"
+	}
+	line += ": " + truncate(oneLine(e.Body), 600)
+	for _, a := range e.Assets {
+		if a.Description != "" {
+			line += " | attachment: " + truncate(oneLine(a.Description), 200)
+		}
+	}
+	return line
 }

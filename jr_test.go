@@ -839,8 +839,10 @@ func TestSummarize(t *testing.T) {
 	}
 }
 
-// A long period is summarized in parts and combined; no entry may be lost.
-func TestSummarizeLongPeriodKeepsEveryEntry(t *testing.T) {
+// A long period is built from day summaries: no entry may be lost, the day
+// summaries are saved, and an entry added later redoes only its own day and
+// the final combine.
+func TestSummarizeLongPeriodByDay(t *testing.T) {
 	e := newEnv(t)
 	body := strings.Repeat("Investigated the export worker and tuned its batch size. ", 9)
 	var all []string
@@ -848,9 +850,6 @@ func TestSummarizeLongPeriodKeepsEveryEntry(t *testing.T) {
 		all = append(all, firstID(e.must(body, "add", "--at", fmt.Sprintf("2026-11-%02dT10:%02d:00+01:00", 9+i%7, i%60))))
 	}
 	out := e.must("", "summarize", "--on", "last week")
-	if e.ai.summaryCalls.Load() < 3 {
-		t.Errorf("want parts plus a combine step, made %d calls", e.ai.summaryCalls.Load())
-	}
 	missing := 0
 	for _, id := range all {
 		if !strings.Contains(out, id[:14]) {
@@ -859,5 +858,21 @@ func TestSummarizeLongPeriodKeepsEveryEntry(t *testing.T) {
 	}
 	if missing > 0 || !strings.Contains(out, "Covers 120 entries") {
 		t.Errorf("%d of 120 entries missing from the summary", missing)
+	}
+	if n := e.ai.summaryCalls.Load(); n != 8 {
+		t.Errorf("want 7 day summaries + 1 combine = 8 calls, made %d", n)
+	}
+	if got := ids(e.must("", "list", "--kind", "summary", "--limit", "100")); len(got) != 8 {
+		t.Errorf("want 7 day summaries and 1 week summary saved, got %d", len(got))
+	}
+
+	calls := e.ai.summaryCalls.Load()
+	late := firstID(e.must("Found the export leak.", "add", "--at", "2026-11-12T18:00:00+01:00"))
+	out = e.must("", "summarize", "--on", "last week")
+	if n := e.ai.summaryCalls.Load() - calls; n != 2 {
+		t.Errorf("an entry added to one day should redo that day and the combine (2 calls), made %d", n)
+	}
+	if !strings.Contains(out, late[:14]) || !strings.Contains(out, "Covers 121 entries") {
+		t.Errorf("the late entry is missing from the redone summary")
 	}
 }
