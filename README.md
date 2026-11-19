@@ -21,15 +21,21 @@ mise use -g github:gezibash/jr
 
 Or download a binary from the releases page, or `go install github.com/gezibash/jr@latest`.
 
-## Requirements
+## Setup
 
-| For | Needs |
+None. Install the binary and start writing: entries, filters, dates,
+open/closed tracking and keyword search all work with nothing else.
+
+Each optional part adds more. Turn them on in any order, whenever you like:
+
+| Adds | Needs |
 |---|---|
 | Search by meaning | [Ollama](https://ollama.com) with `ollama pull embeddinggemma-2:270m` |
 | Reranking, captions, summaries, `search --like` | Cloudflare Workers AI: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` |
 | Video and audio attachments | `ffmpeg`; audio transcription uses `parakeet-mlx` through `uvx` (Apple silicon) |
 
-Without them jr still works: plain keyword search, no captions.
+`jr doctor` shows which parts are on and how to turn on the rest. After
+turning one on, `jr reindex` indexes everything saved before.
 
 ## Use
 

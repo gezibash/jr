@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"sync"
 )
 
@@ -11,12 +13,34 @@ type report struct {
 	lastErr                              error
 }
 
+// awaitingSetup reports whether err only means an optional part of jr has
+// never been set up on this machine (for Ollama: not installed, and never
+// used by this journal). That work stays pending for `jr reindex`
+// without a warning, so a fresh install runs quietly. A part that was set up
+// and then breaks still warns.
+func awaitingSetup(s *Store, err error) bool {
+	var ns notSetUp
+	var od ollamaDown
+	switch {
+	case errors.As(err, &ns):
+		return true
+	case errors.As(err, &od):
+		// Installed but not running, or used here before: worth a warning.
+		_, installed := exec.LookPath("ollama")
+		return installed != nil && !s.HasTextVectors()
+	}
+	return false
+}
+
 // process describes the entry's attachments, then embeds everything still
 // pending. entryID "" means every entry (reindex). It runs after the entry is
 // saved, so a failure here never loses an entry, and all network calls happen
 // outside write transactions.
-func process(s *Store, ai *AI, entryID string) (report, error) {
+// quiet holds back the warnings for parts that were never set up (add,
+// close); reindex passes false, because it is how the user asks for them.
+func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 	var r report
+	hint := false
 	toDescribe, err := s.ToDescribe(entryID)
 	if err != nil {
 		return r, err
@@ -49,6 +73,10 @@ func process(s *Store, ai *AI, entryID string) (report, error) {
 			err = s.SetDescribeError(res.a.Hash, res.err.Error())
 			r.failed++
 			fmt.Fprintf(os.Stderr, "jr: %s can't be described: %v\n", res.a.Name, res.err)
+		case quiet && awaitingSetup(s, res.err):
+			r.waiting++
+			r.lastErr = res.err
+			hint = true
 		default:
 			r.waiting++
 			r.lastErr = res.err
@@ -57,6 +85,10 @@ func process(s *Store, ai *AI, entryID string) (report, error) {
 		if err != nil {
 			return r, err
 		}
+	}
+
+	if hint {
+		fmt.Fprintln(os.Stderr, "jr: attachment saved; captions and transcripts need setup (see `jr doctor`)")
 	}
 
 	ps, err := s.Pending(entryID)
@@ -84,6 +116,9 @@ func process(s *Store, ai *AI, entryID string) (report, error) {
 				err = s.SetError(p.chunkID, errs[i].Error())
 				r.failed++
 				fmt.Fprintf(os.Stderr, "jr: %s can't be embedded: %v\n", p.label, errs[i])
+			case quiet && awaitingSetup(s, errs[i]):
+				r.waiting++
+				r.lastErr = errs[i]
 			default:
 				r.waiting++
 				r.lastErr = errs[i]

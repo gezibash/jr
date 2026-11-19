@@ -90,7 +90,10 @@ func (e *AI) describeVideo(path string) (string, error) {
 	wav := filepath.Join(dir, "a.wav")
 	if ffmpeg("-i", path, "-vn", "-ac", "1", "-ar", "16000", wav) == nil {
 		// A failed transcript must not throw away a good caption.
-		if t, err := transcribe(dir, wav); err != nil {
+		var ns notSetUp
+		if t, err := transcribe(dir, wav); errors.As(err, &ns) {
+			// Not set up here; `jr doctor` says so.
+		} else if err != nil {
 			fmt.Fprintf(os.Stderr, "jr: video sound track not transcribed: %v\n", err)
 		} else if t != "" {
 			desc += "\n\nTranscript:\n" + t
@@ -110,7 +113,7 @@ func transcribe(dir, wav string) (string, error) {
 	cmd := []string{"mise", "exec", "uv", "--", "uvx"}
 	if _, err := exec.LookPath("mise"); err != nil {
 		if _, err := exec.LookPath("uvx"); err != nil {
-			return "", permanent{errors.New("transcription needs mise or uvx (for parakeet-mlx)")}
+			return "", notSetUp{errors.New("transcription needs mise or uvx (for parakeet-mlx)")}
 		}
 		cmd = []string{"uvx"}
 	}
@@ -144,7 +147,7 @@ func transcribe(dir, wav string) (string, error) {
 // ffmpeg failures mean the file can't be decoded; retrying won't help.
 func ffmpeg(args ...string) error {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return permanent{errors.New("ffmpeg is not installed")}
+		return notSetUp{errors.New("ffmpeg is not installed")}
 	}
 	out, err := exec.Command("ffmpeg", append([]string{"-loglevel", "error", "-y"}, args...)...).CombinedOutput()
 	if err != nil {

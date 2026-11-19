@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -49,6 +50,9 @@ func cmdSummarize(args []string) error {
 	}
 	ai, _ := NewAI()
 	sum, err := summarizeFilter(s, ai, g, *f, *refresh)
+	if errors.Is(err, errNoWorkersAI) {
+		return fmt.Errorf("summaries need Workers AI, which is not set up (see `jr doctor`); `jr list` with the same filters shows the entries")
+	}
 	if err != nil {
 		return err
 	}
@@ -132,7 +136,7 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 	if err := s.Insert(sum, []Chunk{{Modality: "text"}}); err != nil {
 		return nil, err
 	}
-	if _, err := process(s, ai, sum.ID); err != nil {
+	if _, err := process(s, ai, sum.ID, true); err != nil {
 		return nil, err
 	}
 	saved, err := s.Get(sum.ID)

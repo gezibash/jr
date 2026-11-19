@@ -3,12 +3,16 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -40,6 +44,7 @@ const usage = `jr — per-project journal
   jr reindex                   describe and embed whatever failed earlier
   jr backup                    consistent copy of the database
   jr where                     print this project's journal directory
+  jr doctor                    what is set up, and how to turn on the rest
   jr version
 
 filters: --since WHEN  --until WHEN  --on WHEN
@@ -52,9 +57,10 @@ WHEN, in local time: today, yesterday, 3 days ago, monday, last monday,
 --session last: the most recent session before this one.
 every command: --project P (default: from git remote, else directory name)
 
-Text is embedded by Ollama on this machine (ollama pull embeddinggemma-2:270m).
-Captions, reranking and --like use Workers AI: set CLOUDFLARE_ACCOUNT_ID
-and CLOUDFLARE_API_TOKEN. Audio is transcribed locally with parakeet-mlx.
+jr works with no setup: entries, filters and keyword search. Optional parts
+add search by meaning (Ollama), reranking, summaries and attachment captions
+(Workers AI), and audio transcripts (parakeet-mlx); run jr doctor to see
+which are on. Entries saved before setup are indexed by jr reindex.
 `
 
 func main() {
@@ -66,7 +72,7 @@ func main() {
 		"add": cmdAdd, "show": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
 		"reindex": cmdReindex, "backup": cmdBackup, "where": cmdWhere,
 		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen,
-		"summarize": cmdSummarize, "summarise": cmdSummarize,
+		"summarize": cmdSummarize, "summarise": cmdSummarize, "doctor": cmdDoctor,
 	}
 	name := os.Args[1]
 	if name == "version" || name == "--version" {
@@ -256,7 +262,7 @@ func cmdAdd(args []string) error {
 	fmt.Println(e.ID)
 	if ai, err := NewAI(); err != nil {
 		fmt.Fprintf(os.Stderr, "jr: saved without embedding (run `jr reindex` later): %v\n", err)
-	} else if _, err := process(s, ai, e.ID); err != nil {
+	} else if _, err := process(s, ai, e.ID, true); err != nil {
 		return err
 	}
 	return nil
@@ -499,11 +505,18 @@ func cmdSearch(args []string) error {
 		if *like != "" {
 			return aiErr
 		}
-		fmt.Fprintf(os.Stderr, "jr: keyword search only: %v\n", aiErr)
+		// Without Ollama set up, keyword search is how jr works; hits are
+		// marked (keyword). Say so only when it finds nothing.
+		if !awaitingSetup(s, aiErr) {
+			fmt.Fprintf(os.Stderr, "jr: keyword search only: %v\n", aiErr)
+		}
 	}
 	hits, err := s.Search(q, qvec, embedder, modalities, *f, order)
 	if err != nil {
 		return err
+	}
+	if len(hits) == 0 && aiErr != nil && awaitingSetup(s, aiErr) {
+		fmt.Fprintln(os.Stderr, "jr: no keyword match; search by meaning is off (see `jr doctor`)")
 	}
 	if qvec != nil && q != "" && len(hits) > 1 {
 		k := min(*limit, 20)
@@ -562,7 +575,7 @@ func cmdReindex(args []string) error {
 	if err != nil {
 		return err
 	}
-	r, err := process(s, ai, "")
+	r, err := process(s, ai, "", false)
 	if err != nil {
 		return err
 	}
@@ -711,6 +724,9 @@ func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
 		}
 	}
 	order, err := ai.Rerank(q, items, k)
+	if errors.Is(err, errNoWorkersAI) {
+		return hits // not set up; `jr doctor` says so
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "jr: not reranked: %v\n", err)
 		return hits
@@ -797,7 +813,7 @@ func setStatus(project string, prefixes []string, status, note string) error {
 			return err
 		}
 		if ai, err := NewAI(); err == nil {
-			if _, err := process(s, ai, ne.ID); err != nil {
+			if _, err := process(s, ai, ne.ID, true); err != nil {
 				return err
 			}
 		}
@@ -810,4 +826,88 @@ func setStatus(project string, prefixes []string, status, note string) error {
 		fmt.Printf("%s  %s  %s\n", id, status, titles[i])
 	}
 	return nil
+}
+
+// cmdDoctor shows which optional parts of jr are on and how to turn on the
+// rest. It never prints a credential, and it exits 0 when parts are off:
+// a journal with none of them is still a working journal.
+func cmdDoctor(args []string) error {
+	fs, project := newFlags("doctor")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	s, _, err := open(*project)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	total, _, _, _, err := s.Stats(Filter{})
+	if err != nil {
+		return err
+	}
+	waiting, err := s.Waiting()
+	if err != nil {
+		return err
+	}
+	ai, _ := NewAI()
+	row := func(name string, on bool, what, howTo string) {
+		state := "on "
+		if !on {
+			state = "off"
+		}
+		fmt.Printf("%-10s %s  %s\n", name, state, what)
+		if !on && howTo != "" {
+			fmt.Printf("%-10s      to turn on: %s\n", "", howTo)
+		}
+	}
+	fmt.Printf("journal    %s: %d entries", s.dir, total)
+	if waiting > 0 {
+		fmt.Printf(", %d item(s) waiting for `jr reindex`", waiting)
+	}
+	fmt.Println()
+	row("basics", true, "add, list, show, keyword search, stats, close", "")
+
+	ollamaOn, howTo := ollamaStatus(ai.ollama)
+	row("ollama", ollamaOn, "search by meaning, not only exact words", howTo)
+	row("workers", ai.cfErr == nil, "reranking, summaries, captions for images and video (Cloudflare Workers AI)",
+		"set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
+	_, ffErr := exec.LookPath("ffmpeg")
+	row("ffmpeg", ffErr == nil, "reading video and audio attachments", "install ffmpeg")
+	_, miseErr := exec.LookPath("mise")
+	_, uvxErr := exec.LookPath("uvx")
+	appleSilicon := runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
+	how := "install mise or uv (runs parakeet-mlx)"
+	if !appleSilicon {
+		how = "needs a Mac with Apple silicon"
+	}
+	row("parakeet", appleSilicon && (miseErr == nil || uvxErr == nil), "transcripts of audio and video", how)
+	if waiting > 0 {
+		fmt.Println("\nAfter turning a part on, run `jr reindex` to index what was saved before.")
+	}
+	return nil
+}
+
+// ollamaStatus asks Ollama which models it has.
+func ollamaStatus(addr string) (bool, string) {
+	const install = "install Ollama (ollama.com), run `ollama serve`, then `ollama pull " + ollamaModel + "`"
+	c := &http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get(addr + "/api/tags")
+	if err != nil {
+		return false, install + " (nothing answers at " + addr + ")"
+	}
+	defer resp.Body.Close()
+	var tags struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&tags) != nil {
+		return false, "check OLLAMA_HOST: " + addr + " did not answer like Ollama"
+	}
+	for _, m := range tags.Models {
+		if m.Name == ollamaModel {
+			return true, ""
+		}
+	}
+	return false, "run `ollama pull " + ollamaModel + "`"
 }

@@ -736,6 +736,23 @@ func (s *Store) Pending(entryID string) ([]pending, error) {
 	return out, rows.Err()
 }
 
+// HasTextVectors reports whether Ollama has ever embedded an entry here.
+func (s *Store) HasTextVectors() bool {
+	var n int
+	s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM chunks WHERE embedder = ? LIMIT 1)`, textEmbedder).Scan(&n)
+	return n > 0
+}
+
+// Waiting counts attachments not yet described and chunks not yet embedded,
+// leaving out the ones that can never be.
+func (s *Store) Waiting() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM chunks WHERE vec IS NULL AND error = '') +
+		(SELECT COUNT(*) FROM assets WHERE description IS NULL AND describe_error = '')`).Scan(&n)
+	return n, err
+}
+
 func (s *Store) SetVec(chunkID int64, v []float32, embedder string) error {
 	_, err := s.db.Exec(`UPDATE chunks SET vec = ?, embedder = ? WHERE id = ?`, encodeVec(v), embedder, chunkID)
 	return err

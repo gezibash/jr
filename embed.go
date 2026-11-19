@@ -88,7 +88,7 @@ func NewAI() (*AI, error) {
 	if e.base == "" {
 		acct := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 		if acct == "" || e.token == "" {
-			e.cfErr = errors.New("set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to use Workers AI")
+			e.cfErr = errNoWorkersAI
 		}
 		e.base = "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai/run"
 	}
@@ -178,7 +178,7 @@ func (e *AI) embedText(input []string) ([][]float32, error) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("ollama is not reachable at %s (start it with `ollama serve`): %w", e.ollama, err)
+		return nil, ollamaDown{e.ollama, err}
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
@@ -409,6 +409,26 @@ func (e *AI) Rerank(query string, items []string, k int) ([]int, error) {
 	}
 	return order, nil
 }
+
+// notSetUp marks a part of jr that this machine has not been set up for:
+// no Workers AI credentials, no ffmpeg, no parakeet. The work waits, quietly,
+// for `jr reindex` after setup; `jr doctor` says how to turn each part on.
+type notSetUp struct{ error }
+
+var errNoWorkersAI = notSetUp{errors.New("Workers AI is not set up (set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)")}
+
+// ollamaDown means nothing answered at the Ollama address. On a journal that
+// has never had a text embedding, that is a machine without Ollama, and jr
+// stays quiet; once embeddings exist, Ollama was set up and is now broken.
+type ollamaDown struct {
+	addr string
+	err  error
+}
+
+func (o ollamaDown) Error() string {
+	return "ollama is not reachable at " + o.addr + " (start it with `ollama serve`)"
+}
+func (o ollamaDown) Unwrap() error { return o.err }
 
 // permanent marks an input that will fail the same way on every retry: the
 // API rejected it, or the file is unreadable or of an unsupported type.

@@ -244,11 +244,13 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type env struct {
-	t      *testing.T
-	home   string
-	ai     *fakeAI
-	url    string
-	ollama string // OLLAMA_HOST; the fake server unless a test changes it
+	t       *testing.T
+	home    string
+	ai      *fakeAI
+	url     string
+	ollama  string // OLLAMA_HOST; the fake server unless a test changes it
+	noCloud bool   // no Workers AI credentials, like a fresh install
+	path    string // PATH for jr, when a test hides tools such as ffmpeg
 }
 
 func newEnv(t *testing.T) *env {
@@ -263,6 +265,13 @@ func (e *env) run(stdin string, args ...string) (string, string, error) {
 	cmd.Env = append(os.Environ(), "JR_HOME="+e.home, "JR_AI_URL="+e.url, "OLLAMA_HOST="+e.ollama,
 		// A fixed clock and zone: Thursday 2026-11-19, 15:30 in Berlin (UTC+1).
 		"TZ=Europe/Berlin", "JR_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
+	if e.path != "" {
+		cmd.Env = append(cmd.Env, "PATH="+e.path)
+	}
+	if e.noCloud {
+		// Blank, so this machine's own Cloudflare settings can't leak in.
+		cmd.Env = append(cmd.Env, "JR_AI_URL=", "CLOUDFLARE_ACCOUNT_ID=", "CLOUDFLARE_API_TOKEN=")
+	}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -576,21 +585,24 @@ func TestSearchDoesNotWaitOnSlowReranker(t *testing.T) {
 
 // With Ollama down, entries are still saved and search still answers by
 // keyword; once Ollama is back, reindex makes them findable by meaning.
-// There is no silent fallback to another embedder.
+// There is no silent fallback to another embedder. On a journal Ollama has
+// never embedded, that is a machine without Ollama and jr stays quiet; once
+// Ollama has been used, losing it is reported.
 func TestOllamaDown(t *testing.T) {
 	e := newEnv(t)
 	e.ollama = "http://127.0.0.1:1" // nothing listens here
+	e.path = t.TempDir()            // and no ollama binary is installed
 	out, errOut, err := e.run("Login form rejects valid credentials.", "add")
 	if err != nil {
 		t.Fatalf("add failed with Ollama down: %v\n%s", err, errOut)
 	}
 	id := firstID(out)
-	if !strings.Contains(errOut, "ollama") || !strings.Contains(errOut, "reindex") {
-		t.Errorf("add should say Ollama is down and to reindex: %q", errOut)
+	if errOut != "" {
+		t.Errorf("add without Ollama ever set up should be quiet: %q", errOut)
 	}
 	out, errOut, _ = e.run("", "search", "Login")
-	if !strings.HasPrefix(out, id) || !strings.Contains(errOut, "keyword search only") {
-		t.Errorf("search should fall back to keywords; stderr %q:\n%s", errOut, out)
+	if !strings.HasPrefix(out, id) || !strings.Contains(out, "(keyword)") || errOut != "" {
+		t.Errorf("search should answer by keyword, quietly; stderr %q:\n%s", errOut, out)
 	}
 
 	e.ollama = e.url
@@ -599,6 +611,91 @@ func TestOllamaDown(t *testing.T) {
 	}
 	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
 		t.Fatalf("not findable by meaning after reindex:\n%s", out)
+	}
+
+	e.ollama = "http://127.0.0.1:1" // set up, now broken
+	_, errOut, _ = e.run("Second entry.", "add")
+	if !strings.Contains(errOut, "ollama") || !strings.Contains(errOut, "reindex") {
+		t.Errorf("add should say Ollama is down and to reindex: %q", errOut)
+	}
+	out, errOut, _ = e.run("", "search", "Login")
+	if !strings.HasPrefix(out, id) || !strings.Contains(errOut, "keyword search only") {
+		t.Errorf("search should warn it fell back to keywords; stderr %q:\n%s", errOut, out)
+	}
+}
+
+// A fresh install has no Ollama and no Workers AI. jr must work without a
+// word of setup noise, say how to get more only when it matters, and index
+// everything saved meanwhile once the parts are turned on.
+func TestFreshInstall(t *testing.T) {
+	e := newEnv(t)
+	e.ollama, e.noCloud = "http://127.0.0.1:1", true
+	e.path = t.TempDir() // a machine with none of the optional tools
+	img := filepath.Join(t.TempDir(), "shot.png")
+	os.WriteFile(img, []byte("\x89PNG settings page"), 0o644)
+
+	out, errOut, err := e.run("Login form rejects valid credentials.", "add")
+	if err != nil || errOut != "" {
+		t.Fatalf("add should work quietly: %v, stderr %q", err, errOut)
+	}
+	id := firstID(out)
+	out, errOut, err = e.run("Settings page layout.", "add", "--attach", img)
+	if err != nil || strings.Count(errOut, "\n") != 1 || !strings.Contains(errOut, "jr doctor") {
+		t.Fatalf("attaching should say once that captions need setup: %v, stderr %q", err, errOut)
+	}
+	imgID := firstID(out)
+
+	if out, errOut, _ := e.run("", "search", "Login"); !strings.HasPrefix(out, id) || errOut != "" {
+		t.Errorf("keyword search should work quietly; stderr %q:\n%s", errOut, out)
+	}
+	if out, errOut, _ := e.run("", "search", "authentication problem"); out != "" || !strings.Contains(errOut, "jr doctor") {
+		t.Errorf("a search with no keyword match should point to jr doctor; stderr %q:\n%s", errOut, out)
+	}
+	_, errOut, err = e.run("", "summarize", "--on", "today")
+	if err == nil || !strings.Contains(errOut, "jr list") || !strings.Contains(errOut, "jr doctor") {
+		t.Errorf("summarize should explain and point to jr list: %v, stderr %q", err, errOut)
+	}
+	doc := e.must("", "doctor")
+	for _, want := range []string{"2 entries", "4 item(s) waiting", "ollama     off", "workers    off", "CLOUDFLARE_API_TOKEN"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("doctor is missing %q:\n%s", want, doc)
+		}
+	}
+
+	// Audio saved before ffmpeg is installed waits for it, instead of being
+	// marked as a file that can never be read.
+	memo := filepath.Join(t.TempDir(), "memo.m4a")
+	os.WriteFile(memo, []byte("not really audio"), 0o644)
+	e.must("Voice memo.", "add", "--attach", memo)
+	e.must("", "reindex")
+	// 4 from before, plus the memo's text, its raw audio and its transcript.
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "7 item(s) waiting") {
+		t.Errorf("audio without ffmpeg should stay waiting:\n%s", doc)
+	}
+
+	// Ollama installed but not running: say so, it is one command away.
+	bin := t.TempDir()
+	os.WriteFile(filepath.Join(bin, "ollama"), []byte("#!/bin/sh\n"), 0o755)
+	e.path = bin
+	if _, errOut, _ := e.run("Third entry.", "add"); !strings.Contains(errOut, "ollama serve") {
+		t.Errorf("with Ollama installed but stopped, add should say so: %q", errOut)
+	}
+	e.path = t.TempDir()
+
+	// Ollama only: search by meaning, and no complaint about reranking.
+	e.ollama = e.url
+	e.must("", "reindex")
+	if out, errOut, _ := e.run("", "search", "authentication problem"); !strings.HasPrefix(out, id) || errOut != "" {
+		t.Errorf("with Ollama on, search by meaning should work quietly; stderr %q:\n%s", errOut, out)
+	}
+
+	// Workers AI too: the attachment saved before setup gets described.
+	e.noCloud = false
+	if out := e.must("", "reindex"); !strings.Contains(out, "described 1 file(s)") {
+		t.Fatalf("reindex after Workers AI setup: %s", out)
+	}
+	if out := e.must("", "search", "picture"); !strings.HasPrefix(out, imgID) {
+		t.Errorf("attachment not searchable after setup:\n%s", out)
 	}
 }
 
