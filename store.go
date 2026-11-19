@@ -35,7 +35,10 @@ var schema = []string{
 		branch TEXT NOT NULL DEFAULT '',
 		commit_sha TEXT NOT NULL DEFAULT '',
 		title TEXT NOT NULL,
-		body TEXT NOT NULL
+		body TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT '', -- '' (not tracked), open or closed
+		closed_at TEXT NOT NULL DEFAULT '',
+		closed_by TEXT NOT NULL DEFAULT '' -- the entry holding the closing note
 	)`,
 	`CREATE INDEX IF NOT EXISTS entries_ts ON entries(ts)`,
 	`CREATE TABLE IF NOT EXISTS tags (
@@ -120,12 +123,32 @@ func Open(project string) (*Store, error) {
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err == nil && v == schemaVersion {
 		return s, nil
 	}
-	// Schema creation runs under the write lock, so two first runs don't race.
+	// Creation and upgrades run under the write lock, so two first runs don't
+	// race; the version is read again once the lock is held.
 	tx, err := db.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", dir, err)
 	}
 	defer tx.Rollback()
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return nil, err
+	}
+	if v > schemaVersion {
+		return nil, fmt.Errorf("%s was written by a newer jr (schema %d, this jr knows %d)", dir, v, schemaVersion)
+	}
+	if v > 0 {
+		// Bring an existing journal up to date before creating anything new.
+		for _, c := range []struct{ table, col, def string }{
+			{"chunks", "embedder", "TEXT NOT NULL DEFAULT ''"},
+			{"entries", "status", "TEXT NOT NULL DEFAULT ''"},
+			{"entries", "closed_at", "TEXT NOT NULL DEFAULT ''"},
+			{"entries", "closed_by", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			if err := addColumn(tx, c.table, c.col, c.def); err != nil {
+				return nil, fmt.Errorf("upgrade: %w", err)
+			}
+		}
+	}
 	for _, q := range schema {
 		if _, err := tx.Exec(q); err != nil {
 			return nil, fmt.Errorf("schema: %w", err)
@@ -137,7 +160,38 @@ func Open(project string) (*Store, error) {
 	return s, tx.Commit()
 }
 
-const schemaVersion = 1
+// 1: first release. 2: open/closed status on entries.
+const schemaVersion = 2
+
+func addColumn(tx *sql.Tx, table, col, def string) error {
+	var n int
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, table, col).Scan(&n); err != nil || n > 0 {
+		return err
+	}
+	_, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + col + ` ` + def)
+	return err
+}
+
+// SetStatus opens, closes or reopens entries. closedBy is the entry holding
+// the closing note, if any.
+func (s *Store) SetStatus(ids []string, status, closedBy string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	closedAt := ""
+	if status == "closed" {
+		closedAt = utc(now())
+	}
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE entries SET status = ?, closed_at = ?, closed_by = ? WHERE id = ?`,
+			status, closedAt, closedBy, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
 // Common media types, in case the system MIME table lacks them.
 var mediaTypes = map[string]string{
@@ -151,6 +205,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 type Entry struct {
 	ID, TS, Project, Session, Author, Kind, Branch, Commit, Title, Body string
+	Status, ClosedAt, ClosedBy                                          string
 	Tags, Links, LinkedFrom, Files                                      []string
 	Assets                                                              []Asset
 }
@@ -230,9 +285,9 @@ func (s *Store) Insert(e Entry, chunks []Chunk) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO entries (id, ts, project, session, author, kind, branch, commit_sha, title, body)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		e.ID, e.TS, e.Project, e.Session, e.Author, e.Kind, e.Branch, e.Commit, e.Title, e.Body); err != nil {
+	if _, err := tx.Exec(`INSERT INTO entries (id, ts, project, session, author, kind, branch, commit_sha, title, body, status)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		e.ID, e.TS, e.Project, e.Session, e.Author, e.Kind, e.Branch, e.Commit, e.Title, e.Body, e.Status); err != nil {
 		return err
 	}
 	for _, t := range e.Tags {
@@ -384,8 +439,9 @@ func (s *Store) Resolve(prefix string) (string, error) {
 
 func (s *Store) Get(id string) (Entry, error) {
 	var e Entry
-	err := s.db.QueryRow(`SELECT id, ts, project, session, author, kind, branch, commit_sha, title, body FROM entries WHERE id = ?`, id).
-		Scan(&e.ID, &e.TS, &e.Project, &e.Session, &e.Author, &e.Kind, &e.Branch, &e.Commit, &e.Title, &e.Body)
+	err := s.db.QueryRow(`SELECT id, ts, project, session, author, kind, branch, commit_sha, title, body, status, closed_at, closed_by
+		FROM entries WHERE id = ?`, id).
+		Scan(&e.ID, &e.TS, &e.Project, &e.Session, &e.Author, &e.Kind, &e.Branch, &e.Commit, &e.Title, &e.Body, &e.Status, &e.ClosedAt, &e.ClosedBy)
 	if err != nil {
 		return e, err
 	}
@@ -426,9 +482,9 @@ func (s *Store) strings(q string, args ...any) []string {
 }
 
 type Filter struct {
-	Kind, Session, Author, File string
-	Since, Until, On            string // see parseWhen
-	Tags                        []string
+	Kind, Session, Author, File, Status string
+	Since, Until, On                    string // see parseWhen
+	Tags                                []string
 }
 
 func utc(t time.Time) string { return t.UTC().Format(time.RFC3339) }
@@ -445,6 +501,13 @@ func (f Filter) where() (string, []any, error) {
 	}
 	if f.Author != "" {
 		add("e.author = ?", f.Author)
+	}
+	switch f.Status {
+	case "":
+	case "open", "closed":
+		add("e.status = ?", f.Status)
+	default:
+		return "", nil, fmt.Errorf("--status is open or closed, not %q", f.Status)
 	}
 	if f.File != "" {
 		// A bare file name matches it in any directory.

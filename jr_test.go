@@ -709,3 +709,69 @@ func TestFileLinksAndStats(t *testing.T) {
 		}
 	}
 }
+
+// "What's still open from last week?" — opt-in open state, closed with a
+// note that stays searchable.
+func TestOpenAndClose(t *testing.T) {
+	e := newEnv(t)
+	bug := firstID(e.must("Export times out for big tenants.", "add", "--kind", "bug", "--open", "--at", "2026-11-10"))
+	todo := firstID(e.must("Write the runbook for restores.", "add", "--kind", "todo", "--at", "2026-11-11"))
+	e.must("Fixed a typo.", "add", "--kind", "bug", "--at", "2026-11-12") // not tracked
+	e.must("Old open idea.", "add", "--kind", "idea", "--open", "--at", "2026-10-01")
+
+	sameSet(t, "open last week", ids(e.must("", "list", "--status", "open", "--on", "last week")), bug, todo)
+
+	out := e.must("", "close", bug[:12], "--note", "Streamed the CSV instead of building it in memory.")
+	if !strings.Contains(out, bug+"  closed") {
+		t.Fatalf("close output: %q", out)
+	}
+	sameSet(t, "open last week after close", ids(e.must("", "list", "--status", "open", "--on", "last week")), todo)
+	sameSet(t, "closed", ids(e.must("", "list", "--status", "closed")), bug)
+
+	show := e.must("", "show", bug)
+	note := ""
+	for _, l := range strings.Split(show, "\n") {
+		if strings.HasPrefix(l, "- status: closed") {
+			f := strings.Fields(l)
+			note = f[len(f)-1]
+		}
+	}
+	if note == "" || !strings.Contains(show, "linked from: "+note) {
+		t.Fatalf("show should say closed by the note entry, which links back:\n%s", show)
+	}
+	if out := e.must("", "search", "--limit", "3", "Streamed the CSV"); !strings.HasPrefix(out, note) {
+		t.Errorf("the closing note should be searchable:\n%s", out)
+	}
+
+	e.must("", "reopen", bug)
+	sameSet(t, "open after reopen", ids(e.must("", "list", "--status", "open", "--on", "last week")), bug, todo)
+	if _, errOut, err := e.run("", "list", "--status", "done"); err == nil || !strings.Contains(errOut, "open or closed") {
+		t.Errorf("unknown status should be refused, stderr %q", errOut)
+	}
+}
+
+// A journal written by the first release (schema 1, no status or embedder
+// columns) must keep working, with its entries intact.
+func TestUpgradeFromSchema1(t *testing.T) {
+	e := newEnv(t)
+	id := firstID(e.must("Entry from the first release.", "add"))
+	db, err := sql.Open("sqlite", filepath.Join(e.home, "test", "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`ALTER TABLE entries DROP COLUMN status`, `ALTER TABLE entries DROP COLUMN closed_at`,
+		`ALTER TABLE entries DROP COLUMN closed_by`, `ALTER TABLE chunks DROP COLUMN embedder`, `PRAGMA user_version = 1`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	if out := e.must("", "list"); !strings.HasPrefix(out, id) {
+		t.Fatalf("old entry missing after upgrade:\n%s", out)
+	}
+	e.must("", "close", id)
+	sameSet(t, "closed after upgrade", ids(e.must("", "list", "--status", "closed")), id)
+}

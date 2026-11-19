@@ -19,12 +19,15 @@ const usage = `jr — per-project journal
 
   jr add [flags] [body…]       add an entry (body from args or stdin); prints its ID
       --title T                default: first line of body
-      --kind K                 decision | bug | idea | log | milestone | note (default note)
+      --kind K                 decision | bug | idea | todo | log | milestone | note (default note)
       --tag T                  repeatable
       --link ID                related entry (ID prefix is enough), repeatable
       --file PATH              file the entry is about, repeatable
       --attach PATH[::CAPTION] image, video or audio, repeatable
       --at WHEN                when it happened (default now), e.g. yesterday
+      --open                   track it as open until closed (todo entries start open)
+  jr close ID… [--note TEXT]   mark entries closed; the note is saved as an entry linked to them
+  jr reopen ID…                mark entries open again
   jr show ID…                  print entries as markdown (ID prefix is enough)
   jr list [filters]            newest first; --oldest for oldest first
   jr search [filters] QUERY    keyword + semantic search over entries and attachment descriptions
@@ -38,7 +41,7 @@ const usage = `jr — per-project journal
 
 filters: --since WHEN  --until WHEN  --on WHEN
          --kind K  --tag T (repeatable, all must match)  --file NAME
-         --session ID|last  --author A  --limit N
+         --status open|closed  --session ID|last  --author A  --limit N
 WHEN, in local time: today, yesterday, 3 days ago, monday, last monday,
          this week, last week, this month, last month, october, 2026-11-18,
          2026-11, 36h, 7d, 2w. --since takes its start, --until its end,
@@ -59,7 +62,7 @@ func main() {
 	cmds := map[string]func([]string) error{
 		"add": cmdAdd, "show": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
 		"reindex": cmdReindex, "backup": cmdBackup, "where": cmdWhere,
-		"sessions": cmdSessions, "stats": cmdStats,
+		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen,
 	}
 	name := os.Args[1]
 	if name == "help" || name == "-h" || name == "--help" {
@@ -124,6 +127,7 @@ func filterFlags(fs *flag.FlagSet) (*Filter, *int) {
 	fs.StringVar(&f.Until, "until", "", "")
 	fs.StringVar(&f.On, "on", "", "")
 	fs.StringVar(&f.File, "file", "", "")
+	fs.StringVar(&f.Status, "status", "", "")
 	fs.Var((*multi)(&f.Tags), "tag", "")
 	return f, fs.Int("limit", 20, "")
 }
@@ -162,6 +166,7 @@ func cmdAdd(args []string) error {
 	fs.Var(&files, "file", "")
 	fs.Var(&attach, "attach", "")
 	at := fs.String("at", "", "")
+	open_ := fs.Bool("open", false, "")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
@@ -206,6 +211,9 @@ func cmdAdd(args []string) error {
 		ID: newID(), TS: utc(ts), Project: g.project,
 		Session: *session, Author: *author, Kind: *kind, Branch: g.branch, Commit: g.commit,
 		Title: *title, Body: body, Tags: tags, Links: links, Files: files,
+	}
+	if *open_ || *kind == "todo" {
+		e.Status = "open"
 	}
 	for _, a := range attach {
 		path, caption, _ := strings.Cut(a, "::")
@@ -289,6 +297,16 @@ func printEntry(e Entry) {
 	if len(e.Links) > 0 {
 		fmt.Printf("- links: %s\n", strings.Join(e.Links, ", "))
 	}
+	switch e.Status {
+	case "open":
+		fmt.Println("- status: open")
+	case "closed":
+		line := "- status: closed " + localTime(e.ClosedAt)
+		if e.ClosedBy != "" {
+			line += " by " + e.ClosedBy
+		}
+		fmt.Println(line)
+	}
 	if len(e.LinkedFrom) > 0 {
 		fmt.Printf("- linked from: %s\n", strings.Join(e.LinkedFrom, ", "))
 	}
@@ -312,6 +330,9 @@ func printEntry(e Entry) {
 
 func summaryLine(e Entry) string {
 	line := fmt.Sprintf("%s  %s  %-9s %s", e.ID, localTime(e.TS), e.Kind, e.Title)
+	if e.Status != "" {
+		line += "  [" + e.Status + "]"
+	}
 	for _, t := range e.Tags {
 		line += " #" + t
 	}
@@ -710,4 +731,72 @@ func embed(ins []Input) ([][]float32, error) {
 		return nil, err
 	}
 	return ai.Embed(ins)
+}
+
+func cmdClose(args []string) error {
+	fs, project := newFlags("close")
+	note := fs.String("note", "", "")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	return setStatus(*project, pos, "closed", *note)
+}
+
+func cmdReopen(args []string) error {
+	fs, project := newFlags("reopen")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	return setStatus(*project, pos, "open", "")
+}
+
+// setStatus closes or reopens entries. A closing note becomes its own entry
+// linked to them, so how something was resolved stays searchable.
+func setStatus(project string, prefixes []string, status, note string) error {
+	if len(prefixes) == 0 {
+		return fmt.Errorf("give at least one entry ID")
+	}
+	s, g, err := open(project)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	var ids, titles []string
+	for _, p := range prefixes {
+		id, err := s.Resolve(p)
+		if err != nil {
+			return err
+		}
+		e, err := s.Get(id)
+		if err != nil {
+			return err
+		}
+		ids, titles = append(ids, id), append(titles, e.Title)
+	}
+	closedBy := ""
+	if note != "" {
+		ne := Entry{
+			ID: newID(), TS: utc(now()), Project: g.project, Session: os.Getenv("CLAUDE_CODE_SESSION_ID"),
+			Author: defaultAuthor(), Kind: "log", Branch: g.branch, Commit: g.commit,
+			Title: "Closed: " + truncate(strings.Join(titles, "; "), 70), Body: note, Links: ids,
+		}
+		if err := s.Insert(ne, []Chunk{{Modality: "text"}}); err != nil {
+			return err
+		}
+		if ai, err := NewAI(); err == nil {
+			if _, err := process(s, ai, ne.ID); err != nil {
+				return err
+			}
+		}
+		closedBy = ne.ID
+	}
+	if err := s.SetStatus(ids, status, closedBy); err != nil {
+		return err
+	}
+	for i, id := range ids {
+		fmt.Printf("%s  %s  %s\n", id, status, titles[i])
+	}
+	return nil
 }
