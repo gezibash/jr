@@ -345,7 +345,8 @@ func (e *AI) chat(content any, maxTokens int) (string, error) {
 		apiErrors
 		Result struct {
 			Choices []struct {
-				Message struct {
+				FinishReason string `json:"finish_reason"`
+				Message      struct {
 					Content string `json:"content"`
 				} `json:"message"`
 			} `json:"choices"`
@@ -360,7 +361,11 @@ func (e *AI) chat(content any, maxTokens int) (string, error) {
 	if len(res.Result.Choices) == 0 {
 		return "", errors.New("workers ai: no reply")
 	}
-	return strings.TrimSpace(res.Result.Choices[0].Message.Content), nil
+	c := res.Result.Choices[0]
+	if c.FinishReason == "length" {
+		fmt.Fprintf(os.Stderr, "jr: the reply hit its %d-token limit and is cut off\n", maxTokens)
+	}
+	return strings.TrimSpace(c.Message.Content), nil
 }
 
 // Rerank asks Gemma 4 to order candidate entries by how well they answer the

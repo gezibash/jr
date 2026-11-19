@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -54,16 +55,17 @@ func TestMain(m *testing.M) {
 // Captions (Gemma) describe a fake image as "A screenshot showing <bytes after
 // the PNG magic>".
 type fakeAI struct {
-	fail        atomic.Bool
-	unauth      atomic.Bool  // answer 401, like a revoked token
-	maxMedia    atomic.Int64 // largest raw media payload sent for embedding
-	rerankFail  atomic.Bool  // reranking calls answer 500
-	rerankDelay atomic.Int64 // reranking calls stall this many seconds first
-	mu          sync.Mutex
-	texts       []string
-	dims        []int
-	ollamaReqs  []string // "model ctx=N" per Ollama request
-	requests    atomic.Int64
+	fail         atomic.Bool
+	unauth       atomic.Bool  // answer 401, like a revoked token
+	maxMedia     atomic.Int64 // largest raw media payload sent for embedding
+	rerankFail   atomic.Bool  // reranking calls answer 500
+	rerankDelay  atomic.Int64 // reranking calls stall this many seconds first
+	summaryCalls atomic.Int64
+	mu           sync.Mutex
+	texts        []string
+	dims         []int
+	ollamaReqs   []string // "model ctx=N" per Ollama request
+	requests     atomic.Int64
 }
 
 func (f *fakeAI) vector(content any) []float32 {
@@ -139,6 +141,21 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} `json:"messages"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
+		if prompt, ok := req.Messages[0].Content.(string); ok && (strings.HasPrefix(prompt, "Summarize") || strings.HasPrefix(prompt, "Combine")) {
+			// Summaries: one bullet citing every [ID] the prompt contains,
+			// so a test can see whether any entry was dropped.
+			f.summaryCalls.Add(1)
+			// One bullet per entry number in the prompt (or per citation in
+			// part summaries being combined), plus a number that matches no
+			// entry, which jr must drop.
+			var lines []string
+			for _, m := range regexp.MustCompile(`(?m)^\[(\d+)\]|- item \[(\d+)\]`).FindAllStringSubmatch(prompt, -1) {
+				lines = append(lines, "- item ["+m[1]+m[2]+"]")
+			}
+			lines = append(lines, "- invented [99999]")
+			reply(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": strings.Join(lines, "\n")}}}})
+			return
+		}
 		if prompt, ok := req.Messages[0].Content.(string); ok {
 			// Reranking: entries containing "rerank-me" go first, the rest
 			// keep their order.
@@ -774,4 +791,73 @@ func TestUpgradeFromSchema1(t *testing.T) {
 	}
 	e.must("", "close", id)
 	sameSet(t, "closed after upgrade", ids(e.must("", "list", "--status", "closed")), id)
+}
+
+// A summary covers exactly the period asked for, cites every entry so the
+// reader can open it, is saved and reused, and is redone when an entry is
+// added to the period later.
+func TestSummarize(t *testing.T) {
+	e := newEnv(t)
+	var yesterday []string
+	for i, at := range []string{"2026-11-18T09:00:00+01:00", "2026-11-18T13:00:00+01:00", "2026-11-18T23:50:00+01:00"} {
+		yesterday = append(yesterday, firstID(e.must(fmt.Sprintf("Yesterday's work, part %d.", i), "add", "--at", at)))
+	}
+	today := firstID(e.must("Today's work.", "add"))
+
+	out := e.must("", "summarize", "--on", "yesterday")
+	for _, id := range yesterday {
+		if !strings.Contains(out, id[:14]) {
+			t.Errorf("summary does not cite %s:\n%s", id[:14], out)
+		}
+	}
+	if strings.Contains(out, today[:14]) || !strings.Contains(out, "Covers 3 entries") || !strings.Contains(out, "Summary: 2026-11-18 → 2026-11-18") {
+		t.Errorf("summary should cover exactly yesterday's 3 entries:\n%s", out)
+	}
+	if strings.Contains(out, "99999") {
+		t.Errorf("a citation that matches no entry must be removed:\n%s", out)
+	}
+	if got := ids(e.must("", "list", "--kind", "summary")); len(got) != 1 {
+		t.Fatalf("want 1 saved summary, got %v", got)
+	}
+
+	calls := e.ai.summaryCalls.Load()
+	e.must("", "summarize", "--on", "yesterday")
+	if n := e.ai.summaryCalls.Load() - calls; n != 0 {
+		t.Errorf("an unchanged period should reuse the saved summary, made %d calls", n)
+	}
+
+	late := firstID(e.must("Logged later, about yesterday.", "add", "--at", "2026-11-18T18:00:00+01:00"))
+	out = e.must("", "summarize", "--on", "yesterday")
+	if !strings.Contains(out, late[:14]) || !strings.Contains(out, "Covers 4 entries") {
+		t.Errorf("summary should be redone with the late entry:\n%s", out)
+	}
+	if got := ids(e.must("", "list", "--kind", "summary")); len(got) != 1 {
+		t.Errorf("the stale summary should be replaced, got %v", got)
+	}
+	if _, errOut, err := e.run("", "summarize"); err == nil || !strings.Contains(errOut, "which period") {
+		t.Errorf("summarize without a period should ask for one, stderr %q", errOut)
+	}
+}
+
+// A long period is summarized in parts and combined; no entry may be lost.
+func TestSummarizeLongPeriodKeepsEveryEntry(t *testing.T) {
+	e := newEnv(t)
+	body := strings.Repeat("Investigated the export worker and tuned its batch size. ", 9)
+	var all []string
+	for i := 0; i < 120; i++ {
+		all = append(all, firstID(e.must(body, "add", "--at", fmt.Sprintf("2026-11-%02dT10:%02d:00+01:00", 9+i%7, i%60))))
+	}
+	out := e.must("", "summarize", "--on", "last week")
+	if e.ai.summaryCalls.Load() < 3 {
+		t.Errorf("want parts plus a combine step, made %d calls", e.ai.summaryCalls.Load())
+	}
+	missing := 0
+	for _, id := range all {
+		if !strings.Contains(out, id[:14]) {
+			missing++
+		}
+	}
+	if missing > 0 || !strings.Contains(out, "Covers 120 entries") {
+		t.Errorf("%d of 120 entries missing from the summary", missing)
+	}
 }

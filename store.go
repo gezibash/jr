@@ -172,6 +172,31 @@ func addColumn(tx *sql.Tx, table, col, def string) error {
 	return err
 }
 
+// Delete removes an entry and everything that hangs off it (used to replace
+// a stale summary).
+func (s *Store) Delete(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM chunks WHERE entry_id = ?`, `DELETE FROM entries_fts WHERE entry_id = ?`,
+		`DELETE FROM tags WHERE entry_id = ?`, `DELETE FROM links WHERE src = ? OR dst = ?`,
+		`DELETE FROM files WHERE entry_id = ?`, `DELETE FROM entry_assets WHERE entry_id = ?`,
+		`DELETE FROM entries WHERE id = ?`,
+	} {
+		args := []any{id}
+		if strings.Count(q, "?") == 2 {
+			args = append(args, id)
+		}
+		if _, err := tx.Exec(q, args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // SetStatus opens, closes or reopens entries. closedBy is the entry holding
 // the closing note, if any.
 func (s *Store) SetStatus(ids []string, status, closedBy string) error {

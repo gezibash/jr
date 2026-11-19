@@ -1,0 +1,258 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	// Entries are sent to Gemma in parts of at most this many characters;
+	// the part summaries are then combined. Keeps each call fast and inside
+	// the model's attention, whatever the period's length.
+	summaryPartChars = 40000
+	shortIDLen       = 14 // time + 4 random characters: unique, and jr show accepts it
+)
+
+// Entries are cited by number, and jr turns the numbers into entry IDs.
+// Asked to copy 14-character IDs, Gemma listed 30-90 per bullet (about 8
+// tokens each), ran out of its 4,000-token budget on a 1,512-entry week, and
+// garbled some IDs.
+const summaryRules = "Cover what was done, decisions and why, problems hit and how they were fixed, " +
+	"and what is still open. Group short markdown bullets under headings. End each bullet with the " +
+	"numbers of up to 5 entries it comes from, like [12, 40]. Leave out nothing important and add " +
+	"nothing that isn't in the entries. No preamble."
+
+const maxCitesPerBullet = 5
+
+func cmdSummarize(args []string) error {
+	fs, project := newFlags("summarize")
+	f, _ := filterFlags(fs)
+	refresh := fs.Bool("refresh", false, "")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	if f.Since == "" && f.Until == "" && f.On == "" && f.Session == "" {
+		return fmt.Errorf(`summarize: say which period, e.g. --on "last week", --since monday or --session last`)
+	}
+	s, g, err := open(*project)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if err := resolveFilter(s, f); err != nil {
+		return err
+	}
+	all, err := s.List(*f, 1_000_000, true)
+	if err != nil {
+		return err
+	}
+	var entries []Entry
+	for _, e := range all {
+		if e.Kind != "summary" {
+			entries = append(entries, e)
+		}
+	}
+	if len(entries) == 0 {
+		fmt.Println("No entries in that period.")
+		return nil
+	}
+	key, err := summaryKey(*f)
+	if err != nil {
+		return err
+	}
+
+	// Reuse the saved summary unless an entry was added after it. IDs sort
+	// by creation time, so a newer ID means a newer entry, even one logged
+	// with --at for an earlier day.
+	newest := ""
+	for _, e := range entries {
+		newest = max(newest, e.ID)
+	}
+	old, _ := s.List(Filter{Kind: "summary"}, 1_000_000, false)
+	for _, o := range old {
+		if o.Title != key {
+			continue
+		}
+		if o.ID > newest && !*refresh {
+			printEntry(o)
+			return nil
+		}
+		if err := s.Delete(o.ID); err != nil {
+			return err
+		}
+	}
+
+	ai, _ := NewAI()
+	body, err := summarizeEntries(ai, entries)
+	if err != nil {
+		return err
+	}
+	first, last := localTime(entries[0].TS), localTime(entries[len(entries)-1].TS)
+	sum := Entry{
+		ID: newID(), TS: utc(now()), Project: g.project, Session: os.Getenv("CLAUDE_CODE_SESSION_ID"),
+		Author: defaultAuthor(), Kind: "summary", Branch: g.branch, Commit: g.commit, Tags: []string{"summary"},
+		Title: key, Body: fmt.Sprintf("%s\n\n_Covers %d entries, %s → %s._", body, len(entries), first, last),
+	}
+	if err := s.Insert(sum, []Chunk{{Modality: "text"}}); err != nil {
+		return err
+	}
+	if _, err := process(s, ai, sum.ID); err != nil {
+		return err
+	}
+	saved, err := s.Get(sum.ID)
+	if err != nil {
+		return err
+	}
+	printEntry(saved)
+	return nil
+}
+
+// summaryKey names a summary by the absolute period and filters it covers,
+// so "last week" asked next week is a different summary.
+func summaryKey(f Filter) (string, error) {
+	ref := now()
+	var parts []string
+	day := func(t time.Time) string { return t.Format("2006-01-02") }
+	span := func(flag, v string, useStart bool) error {
+		if v == "" {
+			return nil
+		}
+		sp, err := parseWhen(v, ref)
+		if err != nil {
+			return fmt.Errorf("%s: %w", flag, err)
+		}
+		switch {
+		case flag == "on":
+			parts = append(parts, day(sp.start)+" → "+day(sp.end.AddDate(0, 0, -1)))
+		case sp.start.Equal(sp.end):
+			parts = append(parts, flag+" "+sp.start.Format("2006-01-02 15:04"))
+		case useStart:
+			parts = append(parts, flag+" "+day(sp.start))
+		default:
+			parts = append(parts, flag+" "+day(sp.end.AddDate(0, 0, -1)))
+		}
+		return nil
+	}
+	if err := span("on", f.On, true); err != nil {
+		return "", err
+	}
+	if err := span("since", f.Since, true); err != nil {
+		return "", err
+	}
+	if err := span("until", f.Until, false); err != nil {
+		return "", err
+	}
+	for _, kv := range [][2]string{{"session", f.Session}, {"kind", f.Kind}, {"status", f.Status}, {"author", f.Author}, {"file", f.File}} {
+		if kv[1] != "" {
+			parts = append(parts, kv[0]+" "+kv[1])
+		}
+	}
+	for _, t := range f.Tags {
+		parts = append(parts, "tag "+t)
+	}
+	return "Summary: " + strings.Join(parts, ", "), nil
+}
+
+// summarizeEntries sends the entries to Gemma, in parts if they are long,
+// and combines the part summaries into one.
+func summarizeEntries(ai *AI, entries []Entry) (string, error) {
+	var parts []string
+	var cur strings.Builder
+	for n, e := range entries {
+		line := fmt.Sprintf("[%d] %s %s", n+1, localTime(e.TS), e.Kind)
+		if e.Status != "" {
+			line += " (" + e.Status + ")"
+		}
+		line += ": " + truncate(oneLine(e.Body), 600)
+		for _, a := range e.Assets {
+			if a.Description != "" {
+				line += " | attachment: " + truncate(oneLine(a.Description), 200)
+			}
+		}
+		if cur.Len()+len(line) > summaryPartChars && cur.Len() > 0 {
+			parts = append(parts, cur.String())
+			cur.Reset()
+		}
+		cur.WriteString(line + "\n")
+	}
+	parts = append(parts, cur.String())
+
+	// Parts go 4 at a time: one after another, a 1,512-entry week took 253 s.
+	sums, errs := make([]string, len(parts)), make([]error, len(parts))
+	if len(parts) > 1 {
+		fmt.Fprintf(os.Stderr, "jr: summarizing %d entries in %d parts\n", len(entries), len(parts))
+	}
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, p := range parts {
+		wg.Add(1)
+		go func(i int, p string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			prompt := "Summarize these journal entries from a software project for a teammate catching up. " + summaryRules + "\n\nEntries:\n" + p
+			sums[i], errs[i] = ai.chat(prompt, 4000)
+		}(i, p)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return "", err
+		}
+	}
+	out := sums[0]
+	if len(sums) > 1 {
+		prompt := "Combine these summaries of consecutive parts of one period into one summary, keeping the [number] citations. " +
+			summaryRules + "\n\n" + strings.Join(sums, "\n\n---\n\n")
+		var err error
+		if out, err = ai.chat(prompt, 4000); err != nil {
+			return "", err
+		}
+	}
+	out, dropped := citeIDs(out, entries)
+	if dropped > 0 {
+		fmt.Fprintf(os.Stderr, "jr: removed %d citations that match no entry in the period\n", dropped)
+	}
+	return out, nil
+}
+
+var (
+	reCiteGroup = regexp.MustCompile(`\[([^\[\]]*)\]`)
+	reNumList   = regexp.MustCompile(`^\s*\d+(\s*[,;]\s*\d+)*\s*$`)
+)
+
+// citeIDs turns [12, 40] citations into entry IDs that jr show accepts,
+// keeps at most 5 per bullet, and drops numbers outside the entry list.
+// Brackets that aren't number lists are left alone.
+func citeIDs(text string, entries []Entry) (string, int) {
+	dropped := 0
+	out := reCiteGroup.ReplaceAllStringFunc(text, func(group string) string {
+		inner := group[1 : len(group)-1]
+		if !reNumList.MatchString(inner) {
+			return group
+		}
+		var keep []string
+		seen := map[int]bool{}
+		for _, f := range strings.FieldsFunc(inner, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
+			n, err := strconv.Atoi(f)
+			if err != nil || n < 1 || n > len(entries) {
+				dropped++
+				continue
+			}
+			if !seen[n] && len(keep) < maxCitesPerBullet {
+				seen[n] = true
+				keep = append(keep, entries[n-1].ID[:shortIDLen])
+			}
+		}
+		if len(keep) == 0 {
+			return ""
+		}
+		return "[" + strings.Join(keep, ", ") + "]"
+	})
+	return out, dropped
+}

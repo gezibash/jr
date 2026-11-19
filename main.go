@@ -35,6 +35,8 @@ const usage = `jr — per-project journal
   jr search --like FILE        find attachments that look or sound like FILE
   jr sessions [filters]        recent sessions: when, how many entries, last title
   jr stats [filters]           counts by kind, tag and author
+  jr summarize [filters]       summary of a period, citing entry IDs; saved and reused
+      --refresh                write it again even if nothing changed
   jr reindex                   describe and embed whatever failed earlier
   jr backup                    consistent copy of the database
   jr where                     print this project's journal directory
@@ -63,6 +65,7 @@ func main() {
 		"add": cmdAdd, "show": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
 		"reindex": cmdReindex, "backup": cmdBackup, "where": cmdWhere,
 		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen,
+		"summarize": cmdSummarize, "summarise": cmdSummarize,
 	}
 	name := os.Args[1]
 	if name == "help" || name == "-h" || name == "--help" {
