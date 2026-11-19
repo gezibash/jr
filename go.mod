@@ -1,4 +1,4 @@
-module jr
+module github.com/gezibash/jr
 
 go 1.27.1
 

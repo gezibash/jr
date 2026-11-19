@@ -40,6 +40,7 @@ const usage = `jr — per-project journal
   jr reindex                   describe and embed whatever failed earlier
   jr backup                    consistent copy of the database
   jr where                     print this project's journal directory
+  jr version
 
 filters: --since WHEN  --until WHEN  --on WHEN
          --kind K  --tag T (repeatable, all must match)  --file NAME
@@ -52,8 +53,8 @@ WHEN, in local time: today, yesterday, 3 days ago, monday, last monday,
 every command: --project P (default: from git remote, else directory name)
 
 Text is embedded by Ollama on this machine (ollama pull embeddinggemma-2:270m).
-Captions, reranking and --like use Workers AI: run jr through op-agent with
-CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID set.
+Captions, reranking and --like use Workers AI: set CLOUDFLARE_ACCOUNT_ID
+and CLOUDFLARE_API_TOKEN. Audio is transcribed locally with parakeet-mlx.
 `
 
 func main() {
@@ -68,6 +69,10 @@ func main() {
 		"summarize": cmdSummarize, "summarise": cmdSummarize,
 	}
 	name := os.Args[1]
+	if name == "version" || name == "--version" {
+		fmt.Println("jr", version)
+		return
+	}
 	if name == "help" || name == "-h" || name == "--help" {
 		fmt.Print(usage)
 		return
@@ -82,6 +87,9 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// version is set at release build time: -ldflags "-X main.version=1.0.0".
+var version = "dev"
 
 // Raw media vectors serve only search --like. Embedding a 941 MB video
 // peaked at 7.6 GB of memory before Workers AI rejected it with 413, while

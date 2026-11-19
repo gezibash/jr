@@ -88,7 +88,7 @@ func NewAI() (*AI, error) {
 	if e.base == "" {
 		acct := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 		if acct == "" || e.token == "" {
-			e.cfErr = errors.New("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must be set (run jr through op-agent)")
+			e.cfErr = errors.New("set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to use Workers AI")
 		}
 		e.base = "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai/run"
 	}
