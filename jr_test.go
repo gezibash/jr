@@ -1233,6 +1233,11 @@ func TestKeysFromEnvFile(t *testing.T) {
 	}
 	serve := func() {
 		go func() {
+			// First an empty answer, as 1Password gives a reader that comes
+			// while another is being served; then the file.
+			if f, err := os.OpenFile(pipe, os.O_WRONLY, 0); err == nil {
+				f.Close()
+			}
 			f, err := os.OpenFile(pipe, os.O_WRONLY, 0)
 			if err == nil {
 				f.WriteString("# from 1Password\nexport JR_CHAT_KEY=\"from-file\"\nJR_CHAT_MODEL=vendor/m\n")

@@ -170,16 +170,27 @@ func envFile() string {
 // answer within wait (1Password closed, or its prompt not yet approved) is
 // skipped with a warning, so jr still saves entries, without the keys.
 func loadEnvFile(path string, wait time.Duration) {
-	if _, err := os.Stat(path); err != nil {
+	info, err := os.Stat(path)
+	if err != nil {
 		return
 	}
+	pipe := info.Mode()&os.ModeNamedPipe != 0
 	type result struct {
 		data []byte
 		err  error
 	}
 	done := make(chan result, 1)
 	go func() {
-		data, err := os.ReadFile(path)
+		// 1Password serves one reader at a time: of 5 jr processes reading
+		// at once, 2 got an empty file. An empty pipe is read again.
+		var data []byte
+		var err error
+		for i := range 20 {
+			if data, err = os.ReadFile(path); err != nil || !pipe || len(bytes.TrimSpace(data)) > 0 {
+				break
+			}
+			time.Sleep(time.Duration(25*(i+1)) * time.Millisecond)
+		}
 		done <- result{data, err}
 	}()
 	var r result
