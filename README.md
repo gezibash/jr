@@ -50,6 +50,23 @@ on the rest. After turning one on, or switching embedding model, `jr reindex`
 indexes everything saved before. Vectors from different embedding models are
 never compared.
 
+A dedicated reranker with a Cohere-style `/rerank` API is faster than asking a
+chat model (`JR_RERANK_URL`, `JR_RERANK_KEY`, `JR_RERANK_MODEL`; Cohere,
+Voyage, Jina, or any of them through Vercel AI Gateway).
+
+Measured on the same 20,000 entries and 30 reworded questions:
+
+| Embeddings + reranker | Right entry first | Median / slowest 5% | Notes |
+|---|---|---|---|
+| EmbeddingGemma 2 (local) + Gemma 4 (Workers AI) | 22 of 30 | 0.8 s / 4.2 s | the default |
+| EmbeddingGemma 2 (local) + Voyage rerank-3-lite | 22 of 30 | 0.56 s / 0.73 s | fastest |
+| Qwen3-Embedding-4B (local) + Gemma 4 | 24 of 30 | 0.93 s / 1.8 s | 8.8 GB of memory in Ollama |
+| Qwen3-Embedding-4B (Vercel) + Voyage rerank-3-lite | 25 of 30 | 1.3 s / 2.2 s | best answers |
+
+Cohere Rerank 5 Pro and Fast and Voyage rerank-3 scored 20 to 22, like Gemma:
+for most of the misses, the right entry was never among the candidates, so
+better embeddings help more than a better reranker.
+
 The numbers below were measured with EmbeddingGemma 2 and Gemma 4. Other
 models will score differently; the reranking and summary prompts were tuned
 on Gemma 4. Keep thinking short or off: a model that reasons at length can

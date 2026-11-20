@@ -426,7 +426,11 @@ func apiMessage(data []byte) string {
 			return truncate(r.Errors[0].Message, 300)
 		}
 	}
-	return truncate(strings.TrimSpace(string(data)), 300)
+	body := strings.TrimSpace(string(data))
+	if strings.HasPrefix(body, "<") {
+		return "the reply is a web page, not an API answer; check the URL"
+	}
+	return truncate(body, 300)
 }
 
 func messageContent(in Input) (any, error) {
