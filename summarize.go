@@ -50,8 +50,8 @@ func cmdSummarize(args []string) error {
 	}
 	ai, _ := NewAI()
 	sum, err := summarizeFilter(s, ai, g, *f, *refresh)
-	if errors.Is(err, errNoWorkersAI) {
-		return fmt.Errorf("summaries need Workers AI, which is not set up (see `jr doctor`); `jr list` with the same filters shows the entries")
+	if errors.Is(err, errNoChat) {
+		return fmt.Errorf("summaries need a chat model, which is not set up (see `jr doctor`); `jr list` with the same filters shows the entries")
 	}
 	if err != nil {
 		return err

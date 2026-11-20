@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -154,14 +155,24 @@ func Open(project string) (*Store, error) {
 			return nil, fmt.Errorf("schema: %w", err)
 		}
 	}
+	if v > 0 && v < 3 {
+		// Before 3, Ollama's native API at OLLAMA_HOST made every text vector.
+		// Its /v1 API gives the same vectors (cosine 1.0 on a 6,700-token
+		// text), so they keep working under the new name.
+		if _, err := tx.Exec(`UPDATE chunks SET embedder = ? WHERE embedder = ?`,
+			embedderID(ollamaURL(), ollamaModel), "ollama/"+ollamaModel+"/768"); err != nil {
+			return nil, fmt.Errorf("upgrade: %w", err)
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return nil, err
 	}
 	return s, tx.Commit()
 }
 
-// 1: first release. 2: open/closed status on entries.
-const schemaVersion = 2
+// 1: first release. 2: open/closed status on entries. 3: text embedders
+// named by model and host.
+const schemaVersion = 3
 
 func addColumn(tx *sql.Tx, table, col, def string) error {
 	var n int
@@ -671,6 +682,11 @@ func (s *Store) List(f Filter, limit int, oldest bool) ([]Entry, error) {
 	out := make([]Entry, 0, len(ids))
 	for _, id := range ids {
 		e, err := s.Get(id)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Deleted since the query, by another session or a summary
+			// being replaced; seen 1 run in 6 in the day-summary test.
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -698,15 +714,17 @@ type pending struct {
 }
 
 // Pending returns chunks of the entry (or all entries, for "") whose
-// embedding has not been computed yet.
-func (s *Store) Pending(entryID string) ([]pending, error) {
+// embedding has not been computed yet, and text whose vector came from
+// another text embedder than textEmb: after a switch of embedding model,
+// reindex brings every entry back into search by meaning.
+func (s *Store) Pending(entryID, textEmb string) ([]pending, error) {
 	q := `SELECT c.id, c.modality, c.hash, e.title, e.body, COALESCE(a.ext, ''), COALESCE(a.mime, ''),
 			COALESCE(ea.name, ''), COALESCE(ea.caption, ''), COALESCE(a.description, '')
 		FROM chunks c JOIN entries e ON e.id = c.entry_id
 		LEFT JOIN assets a ON a.hash = c.hash AND c.hash != ''
 		LEFT JOIN entry_assets ea ON ea.entry_id = c.entry_id AND ea.hash = c.hash
-		WHERE c.vec IS NULL AND c.error = ''`
-	args := []any{}
+		WHERE (c.vec IS NULL OR (c.modality IN ('text', 'caption') AND c.embedder != ?)) AND c.error = ''`
+	args := []any{textEmb}
 	if entryID != "" {
 		q, args = q+` AND c.entry_id = ?`, append(args, entryID)
 	}
@@ -736,20 +754,21 @@ func (s *Store) Pending(entryID string) ([]pending, error) {
 	return out, rows.Err()
 }
 
-// HasTextVectors reports whether Ollama has ever embedded an entry here.
+// HasTextVectors reports whether any text here has ever been embedded.
 func (s *Store) HasTextVectors() bool {
 	var n int
-	s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM chunks WHERE embedder = ? LIMIT 1)`, textEmbedder).Scan(&n)
+	s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM chunks
+		WHERE vec IS NOT NULL AND modality IN ('text', 'caption') LIMIT 1)`).Scan(&n)
 	return n > 0
 }
 
-// Waiting counts attachments not yet described and chunks not yet embedded,
-// leaving out the ones that can never be.
-func (s *Store) Waiting() (int, error) {
+// Waiting counts attachments not yet described and chunks Pending would
+// return, leaving out the ones that can never be done.
+func (s *Store) Waiting(textEmb string) (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT
-		(SELECT COUNT(*) FROM chunks WHERE vec IS NULL AND error = '') +
-		(SELECT COUNT(*) FROM assets WHERE description IS NULL AND describe_error = '')`).Scan(&n)
+		(SELECT COUNT(*) FROM chunks WHERE (vec IS NULL OR (modality IN ('text', 'caption') AND embedder != ?)) AND error = '') +
+		(SELECT COUNT(*) FROM assets WHERE description IS NULL AND describe_error = '')`, textEmb).Scan(&n)
 	return n, err
 }
 

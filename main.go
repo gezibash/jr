@@ -3,12 +3,10 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,10 +55,17 @@ WHEN, in local time: today, yesterday, 3 days ago, monday, last monday,
 --session last: the most recent session before this one.
 every command: --project P (default: from git remote, else directory name)
 
-jr works with no setup: entries, filters and keyword search. Optional parts
-add search by meaning (Ollama), reranking, summaries and attachment captions
-(Workers AI), and audio transcripts (parakeet-mlx); run jr doctor to see
-which are on. Entries saved before setup are indexed by jr reindex.
+jr works with no setup: entries, filters and keyword search. Optional parts,
+any of them through an OpenAI-compatible API:
+  search by meaning   JR_EMBED_URL, JR_EMBED_KEY, JR_EMBED_MODEL
+                      (default: Ollama on this machine, embeddinggemma-2:270m)
+  reranking, summaries, captions
+                      JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL, and JR_CHAT_EXTRA
+                      for extra JSON fields (default with CLOUDFLARE_ACCOUNT_ID
+                      and CLOUDFLARE_API_TOKEN: Gemma 4 on Workers AI)
+  search --like       CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN
+  audio transcripts   parakeet-mlx through mise or uvx (Apple silicon)
+jr doctor shows which are on. jr reindex indexes what was saved before setup.
 `
 
 func main() {
@@ -480,7 +485,11 @@ func cmdSearch(args []string) error {
 	// Text queries rank entry text and attachment descriptions. --like ranks
 	// raw media of the same kind: vectors compare well within one modality,
 	// not across them.
-	in, modalities, embedder := Input{Text: queryText(q)}, []string{"text", "caption"}, textEmbedder
+	ai, err := NewAI()
+	if err != nil {
+		return err
+	}
+	in, modalities, embedder := Input{Text: queryText(q)}, []string{"text", "caption"}, ai.embedID
 	if *like != "" {
 		a := Asset{Mime: mediaTypes[strings.ToLower(filepath.Ext(*like))]}
 		if a.Modality() == "" {
@@ -488,24 +497,21 @@ func cmdSearch(args []string) error {
 		}
 		in, modalities, embedder, q = Input{File: *like, Mime: a.Mime}, []string{a.Modality()}, mediaEmbedder, ""
 	}
-	ai, aiErr := NewAI()
+	// A text query embeds in ~40 ms on Ollama, so it gets a deadline; a
+	// --like file goes to Workers AI and a video can take ~10 s.
+	client := ai.Interactive(embedDeadline)
+	if *like != "" {
+		client = ai
+	}
+	vecs, aiErr := client.Embed([]Input{in})
 	if aiErr == nil {
-		var vecs [][]float32
-		// A text query embeds locally in ~40 ms, so it gets a deadline; a
-		// --like file goes to Workers AI and a video can take ~10 s.
-		client := ai.Interactive(embedDeadline)
-		if *like != "" {
-			client = ai
-		}
-		if vecs, aiErr = client.Embed([]Input{in}); aiErr == nil {
-			qvec = vecs[0]
-		}
+		qvec = vecs[0]
 	}
 	if aiErr != nil {
 		if *like != "" {
 			return aiErr
 		}
-		// Without Ollama set up, keyword search is how jr works; hits are
+		// Without embeddings set up, keyword search is how jr works; hits are
 		// marked (keyword). Say so only when it finds nothing.
 		if !awaitingSetup(s, aiErr) {
 			fmt.Fprintf(os.Stderr, "jr: keyword search only: %v\n", aiErr)
@@ -724,7 +730,7 @@ func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
 		}
 	}
 	order, err := ai.Rerank(q, items, k)
-	if errors.Is(err, errNoWorkersAI) {
+	if errors.Is(err, errNoChat) {
 		return hits // not set up; `jr doctor` says so
 	}
 	if err != nil {
@@ -845,19 +851,26 @@ func cmdDoctor(args []string) error {
 	if err != nil {
 		return err
 	}
-	waiting, err := s.Waiting()
+	ai, err := NewAI()
 	if err != nil {
 		return err
 	}
-	ai, _ := NewAI()
+	waiting, err := s.Waiting(ai.embedID)
+	if err != nil {
+		return err
+	}
 	row := func(name string, on bool, what, howTo string) {
 		state := "on "
 		if !on {
 			state = "off"
 		}
 		fmt.Printf("%-10s %s  %s\n", name, state, what)
-		if !on && howTo != "" {
-			fmt.Printf("%-10s      to turn on: %s\n", "", howTo)
+		if howTo != "" {
+			label := "to turn on:"
+			if on {
+				label = "using:"
+			}
+			fmt.Printf("%-10s      %s %s\n", "", label, howTo)
 		}
 	}
 	fmt.Printf("journal    %s: %d entries", s.dir, total)
@@ -867,47 +880,53 @@ func cmdDoctor(args []string) error {
 	fmt.Println()
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
 
-	ollamaOn, howTo := ollamaStatus(ai.ollama)
-	row("ollama", ollamaOn, "search by meaning, not only exact words", howTo)
-	row("workers", ai.cfErr == nil, "reranking, summaries, captions for images and video (Cloudflare Workers AI)",
-		"set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
+	embedOn, how := embedStatus(ai)
+	row("embedding", embedOn, "search by meaning, not only exact words", how)
+	how = "an OpenAI-compatible API: JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL; " +
+		"or Cloudflare: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN"
+	if ai.chatErr == nil {
+		how = ai.chatModel + " at " + ai.chatURL
+	}
+	row("chat", ai.chatErr == nil, "reranking, summaries, captions for images and video", how)
+	how = ""
+	if ai.cfErr != nil {
+		how = "set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
+	}
+	row("--like", ai.cfErr == nil, "find attachments that look or sound alike (Cloudflare Workers AI)", how)
 	_, ffErr := exec.LookPath("ffmpeg")
-	row("ffmpeg", ffErr == nil, "reading video and audio attachments", "install ffmpeg")
+	how = ""
+	if ffErr != nil {
+		how = "install ffmpeg"
+	}
+	row("ffmpeg", ffErr == nil, "reading video and audio attachments", how)
 	_, miseErr := exec.LookPath("mise")
 	_, uvxErr := exec.LookPath("uvx")
 	appleSilicon := runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
-	how := "install mise or uv (runs parakeet-mlx)"
-	if !appleSilicon {
-		how = "needs a Mac with Apple silicon"
+	parakeetOn := appleSilicon && (miseErr == nil || uvxErr == nil)
+	how = ""
+	if !parakeetOn {
+		how = "install mise or uv (runs parakeet-mlx)"
+		if !appleSilicon {
+			how = "needs a Mac with Apple silicon"
+		}
 	}
-	row("parakeet", appleSilicon && (miseErr == nil || uvxErr == nil), "transcripts of audio and video", how)
+	row("parakeet", parakeetOn, "transcripts of audio and video", how)
 	if waiting > 0 {
 		fmt.Println("\nAfter turning a part on, run `jr reindex` to index what was saved before.")
 	}
 	return nil
 }
 
-// ollamaStatus asks Ollama which models it has.
-func ollamaStatus(addr string) (bool, string) {
-	const install = "install Ollama (ollama.com), run `ollama serve`, then `ollama pull " + ollamaModel + "`"
-	c := &http.Client{Timeout: 2 * time.Second}
-	resp, err := c.Get(addr + "/api/tags")
-	if err != nil {
-		return false, install + " (nothing answers at " + addr + ")"
+// embedStatus embeds one word, which works the same on every provider.
+func embedStatus(ai *AI) (bool, string) {
+	_, err := ai.Interactive(10 * time.Second).embedText([]string{"jr doctor"})
+	if err == nil {
+		return true, ai.embedModel + " at " + ai.embedURL
 	}
-	defer resp.Body.Close()
-	var tags struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
+	var down embedDown
+	if errors.As(err, &down) && !down.set {
+		return false, "install Ollama (ollama.com), run `ollama serve`, then `ollama pull " + ollamaModel +
+			"`; or set JR_EMBED_URL, JR_EMBED_KEY and JR_EMBED_MODEL for any OpenAI-compatible API"
 	}
-	if json.NewDecoder(resp.Body).Decode(&tags) != nil {
-		return false, "check OLLAMA_HOST: " + addr + " did not answer like Ollama"
-	}
-	for _, m := range tags.Models {
-		if m.Name == ollamaModel {
-			return true, ""
-		}
-	}
-	return false, "run `ollama pull " + ollamaModel + "`"
+	return false, err.Error()
 }

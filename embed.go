@@ -8,17 +8,20 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const (
-	embedModel   = "@cf/google/embeddinggemma-2" // media vectors, for search --like
-	captionModel = "@cf/google/gemma-4-26b-a4b-it"
+	embedModel   = "@cf/google/embeddinggemma-2"   // media vectors, for search --like
+	captionModel = "@cf/google/gemma-4-26b-a4b-it" // chat model of the Cloudflare preset
 	// Text is embedded locally. On the 20,000-entry test, Ollama answered in
 	// 40 ms (worst 0.85 s) against 1.5 s (worst 10 s, with 429s) on Workers AI,
 	// and found as many right answers (21-22 of 30 against 21).
@@ -34,11 +37,22 @@ const (
 // Each vector records the embedder that made it, and search compares only
 // vectors from the same one. Vectors from different embedders, or the same
 // model reached another way, are not comparable (measured: cosine 0.74-0.81
-// for one text sent two ways), and nothing else would catch the mix-up.
-const (
-	textEmbedder  = "ollama/" + ollamaModel + "/768"
-	mediaEmbedder = "workers-ai/embeddinggemma-2/768"
-)
+// for one text sent two ways), and nothing else would catch the mix-up. A
+// text embedder is its model and the host serving it (embedderID).
+const mediaEmbedder = "workers-ai/embeddinggemma-2/768"
+
+// embedderID names a text embedder: the model and the host that serves it.
+func embedderID(base, model string) string {
+	host := base
+	if u, err := url.Parse(base); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	h, port, err := net.SplitHostPort(host)
+	if err == nil && (h == "127.0.0.1" || h == "::1") {
+		host = net.JoinHostPort("localhost", port)
+	}
+	return model + "@" + host
+}
 
 // Input is one thing to embed: text, or a media file.
 type Input struct {
@@ -57,14 +71,27 @@ func docText(title, body string) string {
 
 func queryText(q string) string { return "task: search result | query: " + q }
 
-// AI reaches the models jr uses: Ollama on this machine for text
-// embeddings, Workers AI for captions, reranking and media embeddings.
+// AI reaches the models jr uses, all optional:
+//   - text embeddings: any OpenAI-compatible /embeddings API; by default
+//     Ollama on this machine.
+//   - chat, for captions, reranking and summaries: any OpenAI-compatible
+//     /chat/completions API; Cloudflare Workers AI when only its credentials
+//     are set.
+//   - raw media vectors (search --like): Workers AI's own API, which no
+//     standard covers.
 type AI struct {
-	base, token string
-	cfErr       error // set when Workers AI credentials are missing
-	ollama      string
-	hc          *http.Client
-	attempts    int
+	embedURL, embedKey, embedModel, embedID string
+	embedSet                                bool // JR_EMBED_URL was given
+
+	chatURL, chatKey, chatModel string
+	chatExtra                   map[string]any // merged into each chat request
+	chatErr                     error          // set when no chat API is set up
+
+	cfBase, cfToken string
+	cfErr           error // set when Workers AI credentials are missing
+
+	hc       *http.Client
+	attempts int
 }
 
 // Interactive returns a client for a search the user is waiting on: one
@@ -78,26 +105,75 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 	return &c
 }
 
-// NewAI reads CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN for Workers AI,
-// and OLLAMA_HOST (default localhost:11434). Missing Cloudflare credentials
-// only disable the cloud calls; text embedding still works. JR_AI_URL
-// replaces the Workers AI base URL (tests point it at a local server).
+// NewAI reads its settings from the environment:
+//
+//	JR_EMBED_URL, JR_EMBED_KEY, JR_EMBED_MODEL  text embeddings
+//	    (default: Ollama at OLLAMA_HOST or localhost:11434, embeddinggemma-2)
+//	JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL     chat
+//	JR_CHAT_EXTRA                               JSON fields added to each chat request
+//	CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN Workers AI: search --like, and
+//	    chat with Gemma 4 when JR_CHAT_URL is not set
+//
+// JR_AI_URL replaces the Workers AI root, .../accounts/<id>/ai (tests point
+// it at a local server).
+// ollamaURL is the OpenAI-compatible API of Ollama at OLLAMA_HOST.
+func ollamaURL() string {
+	host := os.Getenv("OLLAMA_HOST")
+	if host == "" {
+		host = "localhost:11434"
+	}
+	if !strings.Contains(host, "://") {
+		host = "http://" + host
+	}
+	return strings.TrimSuffix(host, "/") + "/v1"
+}
+
 func NewAI() (*AI, error) {
-	e := &AI{token: os.Getenv("CLOUDFLARE_API_TOKEN"), hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4}
-	e.base = os.Getenv("JR_AI_URL")
-	if e.base == "" {
+	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4}
+
+	e.embedURL = strings.TrimSuffix(os.Getenv("JR_EMBED_URL"), "/")
+	e.embedSet = e.embedURL != ""
+	if !e.embedSet {
+		e.embedURL = ollamaURL()
+	}
+	e.embedKey = os.Getenv("JR_EMBED_KEY")
+	e.embedModel = os.Getenv("JR_EMBED_MODEL")
+	if e.embedModel == "" {
+		e.embedModel = ollamaModel
+	}
+	e.embedID = embedderID(e.embedURL, e.embedModel)
+
+	root := os.Getenv("JR_AI_URL")
+	e.cfToken = os.Getenv("CLOUDFLARE_API_TOKEN")
+	if root == "" {
 		acct := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
-		if acct == "" || e.token == "" {
+		if acct == "" || e.cfToken == "" {
 			e.cfErr = errNoWorkersAI
 		}
-		e.base = "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai/run"
+		root = "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai"
 	}
-	e.ollama = os.Getenv("OLLAMA_HOST")
-	if e.ollama == "" {
-		e.ollama = "localhost:11434"
+	e.cfBase = root + "/run"
+
+	e.chatURL = strings.TrimSuffix(os.Getenv("JR_CHAT_URL"), "/")
+	switch {
+	case e.chatURL != "":
+		e.chatKey, e.chatModel = os.Getenv("JR_CHAT_KEY"), os.Getenv("JR_CHAT_MODEL")
+		if e.chatModel == "" {
+			return nil, errors.New("JR_CHAT_URL is set, so set JR_CHAT_MODEL too")
+		}
+	case e.cfErr == nil:
+		// Gemma 4 on Workers AI. With thinking on, its reasoning used the
+		// whole token budget and the answer came back empty.
+		e.chatURL, e.chatKey, e.chatModel = root+"/v1", e.cfToken, captionModel
+		e.chatExtra = map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}
+	default:
+		e.chatErr = errNoChat
 	}
-	if !strings.Contains(e.ollama, "://") {
-		e.ollama = "http://" + e.ollama
+	if x := os.Getenv("JR_CHAT_EXTRA"); x != "" {
+		e.chatExtra = nil
+		if err := json.Unmarshal([]byte(x), &e.chatExtra); err != nil {
+			return nil, fmt.Errorf("JR_CHAT_EXTRA must be a JSON object: %w", err)
+		}
 	}
 	return e, nil
 }
@@ -166,43 +242,36 @@ func (e *AI) Embed(ins []Input) ([][]float32, error) {
 }
 
 func (e *AI) embedText(input []string) ([][]float32, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model": ollamaModel,
-		"input": input,
-		// Ollama's default window is 2,048 tokens and it cuts longer text
-		// without saying so; 8,192 is the model's full window.
-		"options":    map[string]any{"num_ctx": 8192},
-		"keep_alive": "30m", // reloading after an unload took about 1 s
-	})
-	req, _ := http.NewRequest("POST", e.ollama+"/api/embed", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.hc.Do(req)
-	if err != nil {
-		return nil, ollamaDown{e.ollama, err}
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	switch {
-	case resp.StatusCode == 404:
-		return nil, fmt.Errorf("ollama has no %s model (run `ollama pull %s`)", ollamaModel, ollamaModel)
-	case resp.StatusCode == 400:
-		return nil, permanent{fmt.Errorf("ollama: %s", truncate(string(data), 200))}
-	case resp.StatusCode != 200:
-		return nil, fmt.Errorf("ollama: HTTP %d: %s", resp.StatusCode, truncate(string(data), 200))
-	}
+	body, _ := json.Marshal(map[string]any{"model": e.embedModel, "input": input})
 	var res struct {
-		Embeddings [][]float32 `json:"embeddings"`
+		Data []struct {
+			Index     int       `json:"index"`
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(data, &res); err != nil {
-		return nil, err
+	err := e.post(e.embedURL+"/embeddings", e.embedKey, body, &res)
+	var down unreachable
+	var he httpError
+	switch {
+	case errors.As(err, &down):
+		return nil, embedDown{e.embedURL, e.embedSet, err}
+	case errors.As(err, &he) && he.status == 404 && !e.embedSet:
+		return nil, fmt.Errorf("ollama has no %s model (run `ollama pull %s`)", e.embedModel, e.embedModel)
+	case err != nil:
+		return nil, fmt.Errorf("embeddings at %s: %w", e.embedURL, err)
 	}
-	if len(res.Embeddings) != len(input) {
-		return nil, fmt.Errorf("ollama returned %d embeddings for %d inputs", len(res.Embeddings), len(input))
+	out := make([][]float32, len(input))
+	for _, d := range res.Data {
+		if d.Index >= 0 && d.Index < len(out) {
+			out[d.Index] = normalize(d.Embedding)
+		}
 	}
-	for i := range res.Embeddings {
-		res.Embeddings[i] = normalize(res.Embeddings[i])
+	for i, v := range out {
+		if len(v) == 0 {
+			return nil, fmt.Errorf("embeddings at %s: no vector for input %d", e.embedURL, i)
+		}
 	}
-	return res.Embeddings, nil
+	return out, nil
 }
 
 func (e *AI) embedRequest(req map[string]any, n int) ([][]float32, error) {
@@ -220,7 +289,10 @@ func (e *AI) embedRequest(req map[string]any, n int) ([][]float32, error) {
 			} `json:"data"`
 		} `json:"result"`
 	}
-	if err := e.post(embedModel, body, &res); err != nil {
+	if e.cfErr != nil {
+		return nil, e.cfErr
+	}
+	if err := e.post(e.cfBase+"/"+embedModel, e.cfToken, body, &res); err != nil {
 		return nil, err
 	}
 	if err := res.err(); err != nil {
@@ -241,23 +313,36 @@ func (e *AI) embedRequest(req map[string]any, n int) ([][]float32, error) {
 	return out, nil
 }
 
-// post retries rate limits, server errors and network failures with backoff,
-// so a burst from many parallel sessions slows down instead of failing.
-func (e *AI) post(model string, body []byte, out any) error {
-	if e.cfErr != nil {
-		return e.cfErr
-	}
+// httpError is a reply other than 200, with the API's own message.
+type httpError struct {
+	status int
+	msg    string
+}
+
+func (h httpError) Error() string { return fmt.Sprintf("HTTP %d: %s", h.status, h.msg) }
+
+// unreachable means nothing listens at the address. Retrying won't help,
+// and a missing local Ollama must not cost seconds of backoff on every add.
+type unreachable struct{ error }
+
+// post sends JSON to an API and decodes the reply. It retries rate limits,
+// server errors and network failures with backoff, so a burst from many
+// parallel sessions slows down instead of failing.
+func (e *AI) post(url, key string, body []byte, out any) error {
 	var last error
 	for attempt := 0; attempt < e.attempts; attempt++ {
 		if attempt > 0 {
 			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
 		}
-		req, _ := http.NewRequest("POST", e.base+"/"+model, bytes.NewReader(body))
+		req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		if e.token != "" {
-			req.Header.Set("Authorization", "Bearer "+e.token)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
 		}
 		resp, err := e.hc.Do(req)
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return unreachable{err}
+		}
 		if err != nil {
 			last = err
 			continue
@@ -265,14 +350,14 @@ func (e *AI) post(model string, body []byte, out any) error {
 		data, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			last = fmt.Errorf("workers ai: HTTP %d", resp.StatusCode)
+			last = httpError{resp.StatusCode, apiMessage(data)}
 			continue
 		}
 		if err != nil {
 			return err
 		}
 		if resp.StatusCode != 200 {
-			err := fmt.Errorf("workers ai: HTTP %d: %s", resp.StatusCode, truncate(string(data), 300))
+			err := httpError{resp.StatusCode, apiMessage(data)}
 			// Only statuses about the input itself are permanent. A bad token
 			// (401/403) or a missing model (404) must stay retryable, or every
 			// entry written meanwhile would be skipped by reindex forever.
@@ -285,6 +370,32 @@ func (e *AI) post(model string, body []byte, out any) error {
 		return json.Unmarshal(data, out)
 	}
 	return last
+}
+
+// apiMessage pulls the error message out of a reply in the shapes OpenAI,
+// Cloudflare and Ollama use, or else returns the start of the body.
+func apiMessage(data []byte) string {
+	var r struct {
+		Error  json.RawMessage `json:"error"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(data, &r) == nil {
+		var m struct {
+			Message string `json:"message"`
+		}
+		var str string
+		switch {
+		case json.Unmarshal(r.Error, &m) == nil && m.Message != "":
+			return truncate(m.Message, 300)
+		case json.Unmarshal(r.Error, &str) == nil && str != "":
+			return truncate(str, 300)
+		case len(r.Errors) > 0:
+			return truncate(r.Errors[0].Message, 300)
+		}
+	}
+	return truncate(strings.TrimSpace(string(data)), 300)
 }
 
 func messageContent(in Input) (any, error) {
@@ -308,7 +419,7 @@ func messageContent(in Input) (any, error) {
 	return nil, permanent{fmt.Errorf("cannot embed %s", in.Mime)}
 }
 
-// Caption asks Gemma 4 to describe one or more images (video frames are sent
+// Caption asks the chat model to describe one or more images (video frames are sent
 // as images; the Workers AI build of Gemma 4 takes text and images only).
 func (e *AI) Caption(images []string, prompt string) (string, error) {
 	var content []any
@@ -324,51 +435,50 @@ func (e *AI) Caption(images []string, prompt string) (string, error) {
 	content = append(content, map[string]any{"type": "text", "text": prompt})
 	out, err := e.chat(content, 2048) // room to transcribe a full screen of text
 	if err == nil && out == "" {
-		err = errors.New("workers ai: empty caption")
+		err = errors.New("empty caption")
 	}
 	return out, err
 }
 
-// chat sends one user message to Gemma 4 and returns the reply text.
+// chat sends one user message to the chat model and returns the reply text.
 func (e *AI) chat(content any, maxTokens int) (string, error) {
-	body, err := json.Marshal(map[string]any{
+	if e.chatErr != nil {
+		return "", e.chatErr
+	}
+	req := map[string]any{
+		"model":                 e.chatModel,
 		"messages":              []any{map[string]any{"role": "user", "content": content}},
 		"max_completion_tokens": maxTokens,
-		// With thinking on, the reasoning used the whole token budget and the
-		// answer came back empty.
-		"chat_template_kwargs": map[string]any{"enable_thinking": false},
-	})
+	}
+	for k, v := range e.chatExtra {
+		req[k] = v
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return "", err
 	}
 	var res struct {
-		apiErrors
-		Result struct {
-			Choices []struct {
-				FinishReason string `json:"finish_reason"`
-				Message      struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		} `json:"result"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
 	}
-	if err := e.post(captionModel, body, &res); err != nil {
-		return "", err
+	if err := e.post(e.chatURL+"/chat/completions", e.chatKey, body, &res); err != nil {
+		return "", fmt.Errorf("chat at %s: %w", e.chatURL, err)
 	}
-	if err := res.err(); err != nil {
-		return "", err
+	if len(res.Choices) == 0 {
+		return "", fmt.Errorf("chat at %s: no reply", e.chatURL)
 	}
-	if len(res.Result.Choices) == 0 {
-		return "", errors.New("workers ai: no reply")
-	}
-	c := res.Result.Choices[0]
+	c := res.Choices[0]
 	if c.FinishReason == "length" {
 		fmt.Fprintf(os.Stderr, "jr: the reply hit its %d-token limit and is cut off\n", maxTokens)
 	}
 	return strings.TrimSpace(c.Message.Content), nil
 }
 
-// Rerank asks Gemma 4 to order candidate entries by how well they answer the
+// Rerank asks the chat model to order candidate entries by how well they answer the
 // query, and returns up to k candidate positions, best first. On the 20,000
 // entry test, this put the right entry first for 21 of 30 reworded questions,
 // against 11 for keyword+vector fusion alone.
@@ -411,24 +521,34 @@ func (e *AI) Rerank(query string, items []string, k int) ([]int, error) {
 }
 
 // notSetUp marks a part of jr that this machine has not been set up for:
-// no Workers AI credentials, no ffmpeg, no parakeet. The work waits, quietly,
-// for `jr reindex` after setup; `jr doctor` says how to turn each part on.
+// no chat API, no Workers AI credentials, no ffmpeg, no parakeet. The work
+// waits, quietly, for `jr reindex` after setup; `jr doctor` says how to turn
+// each part on.
 type notSetUp struct{ error }
 
-var errNoWorkersAI = notSetUp{errors.New("Workers AI is not set up (set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)")}
+var (
+	errNoChat = notSetUp{errors.New("no chat model is set up (set JR_CHAT_URL, JR_CHAT_KEY and JR_CHAT_MODEL, " +
+		"or CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)")}
+	errNoWorkersAI = notSetUp{errors.New("Workers AI is not set up (set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)")}
+)
 
-// ollamaDown means nothing answered at the Ollama address. On a journal that
-// has never had a text embedding, that is a machine without Ollama, and jr
-// stays quiet; once embeddings exist, Ollama was set up and is now broken.
-type ollamaDown struct {
+// embedDown means nothing answered at the embeddings address. With no
+// JR_EMBED_URL, no ollama installed and no text embedding in the journal yet,
+// that is a machine without Ollama, and jr stays quiet; otherwise it was set
+// up and is now broken.
+type embedDown struct {
 	addr string
+	set  bool // JR_EMBED_URL was given
 	err  error
 }
 
-func (o ollamaDown) Error() string {
-	return "ollama is not reachable at " + o.addr + " (start it with `ollama serve`)"
+func (d embedDown) Error() string {
+	if d.set {
+		return "nothing answers at JR_EMBED_URL " + d.addr
+	}
+	return "ollama is not reachable at " + strings.TrimSuffix(d.addr, "/v1") + " (start it with `ollama serve`)"
 }
-func (o ollamaDown) Unwrap() error { return o.err }
+func (d embedDown) Unwrap() error { return d.err }
 
 // permanent marks an input that will fail the same way on every retry: the
 // API rejected it, or the file is unreadable or of an unsupported type.

@@ -30,12 +30,30 @@ Each optional part adds more. Turn them on in any order, whenever you like:
 
 | Adds | Needs |
 |---|---|
-| Search by meaning | [Ollama](https://ollama.com) with `ollama pull embeddinggemma-2:270m` |
-| Reranking, captions, summaries, `search --like` | Cloudflare Workers AI: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` |
+| Search by meaning | An embedding model. Default: [Ollama](https://ollama.com) on this machine with `ollama pull embeddinggemma-2:270m` |
+| Reranking, captions, summaries | A chat model that takes images. Default, when `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are set: Gemma 4 on Cloudflare Workers AI |
+| `search --like` (attachments that look or sound alike) | Cloudflare Workers AI |
 | Video and audio attachments | `ffmpeg`; audio transcription uses `parakeet-mlx` through `uvx` (Apple silicon) |
 
-`jr doctor` shows which parts are on and how to turn on the rest. After
-turning one on, `jr reindex` indexes everything saved before.
+The embedding and chat models can come from any service with an
+OpenAI-compatible API: OpenAI, Vercel AI Gateway, OpenRouter, Cloudflare,
+Ollama, LM Studio, vLLM and others. Give each a base URL, a key and a model:
+
+```bash
+JR_EMBED_URL=https://api.openai.com/v1  JR_EMBED_KEY=…  JR_EMBED_MODEL=text-embedding-3-small
+JR_CHAT_URL=https://ai-gateway.vercel.sh/v1  JR_CHAT_KEY=…  JR_CHAT_MODEL=google/gemini-3-flash
+JR_CHAT_EXTRA='{"reasoning_effort":"low"}'   # optional JSON fields added to each chat request
+```
+
+`jr doctor` shows which parts are on, which models they use, and how to turn
+on the rest. After turning one on, or switching embedding model, `jr reindex`
+indexes everything saved before. Vectors from different embedding models are
+never compared.
+
+The numbers below were measured with EmbeddingGemma 2 and Gemma 4. Other
+models will score differently; the reranking and summary prompts were tuned
+on Gemma 4. Keep thinking short or off: a model that reasons at length can
+use up its reply budget and return nothing.
 
 Measured on 20,000 entries spread over 3 months, with 30 test questions:
 

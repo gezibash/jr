@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -64,7 +65,8 @@ type fakeAI struct {
 	mu           sync.Mutex
 	texts        []string
 	dims         []int
-	ollamaReqs   []string // "model ctx=N" per Ollama request
+	embedModels  []string         // model named in each text embedding request
+	chatReqs     []map[string]any // each chat request body, plus "auth"
 	requests     atomic.Int64
 }
 
@@ -104,22 +106,21 @@ func (f *fakeAI) vector(content any) []float32 {
 
 func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.requests.Add(1)
-	// fail and unauth model Workers AI trouble; Ollama is local and unaffected.
-	if r.URL.Path == "/api/embed" { // Ollama, on this machine
+	// fail and unauth model cloud trouble; Ollama is local and unaffected.
+	if r.URL.Path == "/v1/embeddings" { // Ollama's OpenAI-compatible API
 		var req struct {
-			Model   string         `json:"model"`
-			Input   []string       `json:"input"`
-			Options map[string]any `json:"options"`
+			Model string   `json:"model"`
+			Input []string `json:"input"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		f.mu.Lock()
-		f.ollamaReqs = append(f.ollamaReqs, fmt.Sprintf("%s ctx=%v", req.Model, req.Options["num_ctx"]))
+		f.embedModels = append(f.embedModels, req.Model)
 		f.mu.Unlock()
-		var embs [][]float32
-		for _, t := range req.Input {
-			embs = append(embs, f.vector(t))
+		var data []map[string]any
+		for i, t := range req.Input {
+			data = append(data, map[string]any{"index": i, "embedding": f.vector(t)})
 		}
-		json.NewEncoder(w).Encode(map[string]any{"embeddings": embs})
+		json.NewEncoder(w).Encode(map[string]any{"data": data})
 		return
 	}
 	if f.fail.Load() {
@@ -134,13 +135,21 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"success": true, "result": result})
 	}
 	switch {
-	case strings.HasSuffix(r.URL.Path, "/gemma-4-26b-a4b-it"):
+	case strings.HasSuffix(r.URL.Path, "/v1/chat/completions"): // OpenAI format, no envelope
+		reply := func(result any) { json.NewEncoder(w).Encode(result) }
+		body, _ := io.ReadAll(r.Body)
+		var sent map[string]any
+		json.Unmarshal(body, &sent)
+		sent["auth"] = r.Header.Get("Authorization")
+		f.mu.Lock()
+		f.chatReqs = append(f.chatReqs, sent)
+		f.mu.Unlock()
 		var req struct {
 			Messages []struct {
 				Content any `json:"content"`
 			} `json:"messages"`
 		}
-		json.NewDecoder(r.Body).Decode(&req)
+		json.Unmarshal(body, &req)
 		if prompt, ok := req.Messages[0].Content.(string); ok && strings.HasPrefix(prompt, "Write a short overview") {
 			// Overview of a long period: one bullet per day it was given,
 			// plus a day that doesn't exist, which jr must drop.
@@ -197,7 +206,7 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		caption := "A screenshot showing " + strings.TrimPrefix(string(raw), "\x89PNG ")
 		reply(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": caption}}}})
 		return
-	case !strings.HasSuffix(r.URL.Path, "/embeddinggemma-2"):
+	case r.URL.Path != "/run/@cf/google/embeddinggemma-2":
 		http.Error(w, "unknown model "+r.URL.Path, 404)
 		return
 	}
@@ -248,9 +257,10 @@ type env struct {
 	home    string
 	ai      *fakeAI
 	url     string
-	ollama  string // OLLAMA_HOST; the fake server unless a test changes it
-	noCloud bool   // no Workers AI credentials, like a fresh install
-	path    string // PATH for jr, when a test hides tools such as ffmpeg
+	ollama  string   // OLLAMA_HOST; the fake server unless a test changes it
+	noCloud bool     // no Workers AI credentials, like a fresh install
+	extra   []string // more environment, such as JR_CHAT_URL=...
+	path    string   // PATH for jr, when a test hides tools such as ffmpeg
 }
 
 func newEnv(t *testing.T) *env {
@@ -265,6 +275,10 @@ func (e *env) run(stdin string, args ...string) (string, string, error) {
 	cmd.Env = append(os.Environ(), "JR_HOME="+e.home, "JR_AI_URL="+e.url, "OLLAMA_HOST="+e.ollama,
 		// A fixed clock and zone: Thursday 2026-11-19, 15:30 in Berlin (UTC+1).
 		"TZ=Europe/Berlin", "JR_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
+	// This machine's own settings must not leak in.
+	cmd.Env = append(cmd.Env, "JR_CHAT_URL=", "JR_CHAT_KEY=", "JR_CHAT_MODEL=", "JR_CHAT_EXTRA=",
+		"JR_EMBED_URL=", "JR_EMBED_KEY=", "JR_EMBED_MODEL=", "CLOUDFLARE_API_TOKEN=cf-test")
+	cmd.Env = append(cmd.Env, e.extra...)
 	if e.path != "" {
 		cmd.Env = append(cmd.Env, "PATH="+e.path)
 	}
@@ -355,14 +369,13 @@ func TestSearchFindsByKeywordAndByMeaning(t *testing.T) {
 			t.Errorf("text sent without a task prefix: %q", txt)
 		}
 	}
-	// Text goes to the local model with its full 8,192-token window (Ollama's
-	// default of 2,048 cuts long text without saying so).
-	if len(e.ai.ollamaReqs) == 0 {
+	// With no settings, text goes to EmbeddingGemma on Ollama.
+	if len(e.ai.embedModels) == 0 {
 		t.Error("no text was embedded through Ollama")
 	}
-	for _, r := range e.ai.ollamaReqs {
-		if r != "embeddinggemma-2:270m ctx=8192" {
-			t.Errorf("ollama request %q, want embeddinggemma-2:270m ctx=8192", r)
+	for _, m := range e.ai.embedModels {
+		if m != "embeddinggemma-2:270m" {
+			t.Errorf("embedding request for %q, want embeddinggemma-2:270m", m)
 		}
 	}
 }
@@ -634,9 +647,14 @@ func TestFreshInstall(t *testing.T) {
 	img := filepath.Join(t.TempDir(), "shot.png")
 	os.WriteFile(img, []byte("\x89PNG settings page"), 0o644)
 
+	start := time.Now()
 	out, errOut, err := e.run("Login form rejects valid credentials.", "add")
 	if err != nil || errOut != "" {
 		t.Fatalf("add should work quietly: %v, stderr %q", err, errOut)
+	}
+	// A refused connection is not retried: backoff would cost 7 s per add.
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("add without Ollama took %s", d)
 	}
 	id := firstID(out)
 	out, errOut, err = e.run("Settings page layout.", "add", "--attach", img)
@@ -656,7 +674,7 @@ func TestFreshInstall(t *testing.T) {
 		t.Errorf("summarize should explain and point to jr list: %v, stderr %q", err, errOut)
 	}
 	doc := e.must("", "doctor")
-	for _, want := range []string{"2 entries", "4 item(s) waiting", "ollama     off", "workers    off", "CLOUDFLARE_API_TOKEN"} {
+	for _, want := range []string{"2 entries", "4 item(s) waiting", "embedding  off", "chat       off", "CLOUDFLARE_API_TOKEN"} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("doctor is missing %q:\n%s", want, doc)
 		}
@@ -999,5 +1017,92 @@ func TestSummarizeLongPeriodByDay(t *testing.T) {
 	day12 := regexp.MustCompile(`2026-11-12 \[([0-9A-Z]{14})\]`).FindStringSubmatch(out)
 	if day12 == nil || !strings.Contains(e.must("", "show", day12[1]), late[:14]) {
 		t.Errorf("the late entry should be cited in the redone day summary")
+	}
+}
+
+// Any OpenAI-compatible chat API works: jr sends the configured model, key
+// and extra fields, and none of the Cloudflare preset's Gemma settings.
+// With only Cloudflare credentials, the preset is Gemma 4 with thinking off.
+func TestAnyChatProvider(t *testing.T) {
+	e := newEnv(t)
+	img := filepath.Join(t.TempDir(), "shot.png")
+	os.WriteFile(img, []byte("\x89PNG settings page"), 0o644)
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("rerank-me: Login is slow on Mondays.", "add")
+
+	e.must("", "search", "Login")
+	preset := e.ai.chatReqs[len(e.ai.chatReqs)-1]
+	thinking, _ := preset["chat_template_kwargs"].(map[string]any)
+	if preset["model"] != "@cf/google/gemma-4-26b-a4b-it" || preset["auth"] != "Bearer cf-test" || thinking["enable_thinking"] != false {
+		t.Errorf("Cloudflare preset: want Gemma 4, the Cloudflare token and thinking off, got %v", preset)
+	}
+
+	e.noCloud = true
+	e.extra = []string{"JR_CHAT_URL=" + e.url + "/v1/", "JR_CHAT_KEY=k-test", "JR_CHAT_MODEL=vendor/some-model",
+		`JR_CHAT_EXTRA={"reasoning_effort":"low"}`}
+	out, errOut, err := e.run("", "search", "Login")
+	if err != nil || !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") {
+		t.Fatalf("search should be reranked by the configured model: %v %q\n%s", err, errOut, out)
+	}
+	got := e.ai.chatReqs[len(e.ai.chatReqs)-1]
+	if got["model"] != "vendor/some-model" || got["auth"] != "Bearer k-test" || got["reasoning_effort"] != "low" {
+		t.Errorf("want the configured model, key and extra field, got %v", got)
+	}
+	if _, ok := got["chat_template_kwargs"]; ok {
+		t.Errorf("Gemma settings sent to another provider: %v", got)
+	}
+	if out := e.must("Settings page.", "add", "--attach", img); out == "" {
+		t.Fatal("no ID")
+	}
+	if out := e.must("", "search", "picture"); !strings.Contains(out, "A screenshot showing settings page") && !strings.Contains(out, "matched") {
+		t.Errorf("attachment not captioned through the configured model:\n%s", out)
+	}
+
+	e.extra = []string{"JR_CHAT_URL=" + e.url + "/v1"}
+	if _, errOut, err := e.run("", "search", "Login"); err == nil || !strings.Contains(errOut, "JR_CHAT_MODEL") {
+		t.Errorf("a chat URL without a model should be refused: %v %q", err, errOut)
+	}
+}
+
+// Switching the embedding model must not mix vectors: entries embedded by
+// the old model are not matched until reindex embeds them with the new one.
+func TestSwitchEmbeddingModel(t *testing.T) {
+	e := newEnv(t)
+	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	e.extra = []string{"JR_EMBED_URL=" + e.url + "/v1", "JR_EMBED_KEY=k", "JR_EMBED_MODEL=other-embedder"}
+	if out := e.must("", "search", "authentication problem"); strings.Contains(out, id) {
+		t.Fatalf("matched a vector from the old model:\n%s", out)
+	}
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "1 item(s) waiting") || !strings.Contains(doc, "other-embedder") {
+		t.Errorf("doctor should show the new model and the entry waiting for it:\n%s", doc)
+	}
+	if out := e.must("", "reindex"); !strings.Contains(out, "embedded 1 ") {
+		t.Fatalf("reindex should re-embed the entry: %q", out)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
+		t.Fatalf("not found by meaning after reindex with the new model:\n%s", out)
+	}
+	if m := e.ai.embedModels[len(e.ai.embedModels)-1]; m != "other-embedder" {
+		t.Errorf("last embedding request used %q", m)
+	}
+}
+
+// A journal from before schema 3 has vectors named by the old scheme. They
+// came from the same model and API, so they keep working without reindex.
+func TestUpgradeKeepsOllamaVectors(t *testing.T) {
+	e := newEnv(t)
+	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	db, err := sql.Open("sqlite", filepath.Join(e.home, "test", "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`UPDATE chunks SET embedder = 'ollama/embeddinggemma-2:270m/768'`, `PRAGMA user_version = 2`} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
+		t.Fatalf("old vectors lost after the upgrade:\n%s", out)
 	}
 }

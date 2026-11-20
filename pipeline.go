@@ -20,14 +20,15 @@ type report struct {
 // and then breaks still warns.
 func awaitingSetup(s *Store, err error) bool {
 	var ns notSetUp
-	var od ollamaDown
+	var down embedDown
 	switch {
 	case errors.As(err, &ns):
 		return true
-	case errors.As(err, &od):
-		// Installed but not running, or used here before: worth a warning.
+	case errors.As(err, &down):
+		// Chosen with JR_EMBED_URL, installed but not running, or used here
+		// before: worth a warning.
 		_, installed := exec.LookPath("ollama")
-		return installed != nil && !s.HasTextVectors()
+		return !down.set && installed != nil && !s.HasTextVectors()
 	}
 	return false
 }
@@ -91,7 +92,7 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 		fmt.Fprintln(os.Stderr, "jr: attachment saved; captions and transcripts need setup (see `jr doctor`)")
 	}
 
-	ps, err := s.Pending(entryID)
+	ps, err := s.Pending(entryID, ai.embedID)
 	if err != nil {
 		return r, err
 	}
@@ -105,7 +106,7 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 		for i, p := range batch {
 			switch {
 			case errs[i] == nil:
-				emb := textEmbedder
+				emb := ai.embedID
 				if p.in.File != "" {
 					emb = mediaEmbedder
 				}
