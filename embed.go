@@ -22,27 +22,23 @@ import (
 )
 
 const (
-	embedModel   = "@cf/google/embeddinggemma-2"   // media vectors, for search --like
-	captionModel = "@cf/google/gemma-4-26b-a4b-it" // chat model of the Cloudflare preset
 	// Text is embedded locally. On the 20,000-entry test, Ollama answered in
 	// 40 ms (worst 0.85 s) against 1.5 s (worst 10 s, with 429s) on Workers AI,
 	// and found as many right answers (21-22 of 30 against 21).
 	ollamaModel = "embeddinggemma-2:270m"
-	// Full size. On a 20,000-entry test, 256 dims put a reworded question's
-	// answer first 2 times in 30 (typical rank 160th); 768 did 10 in 30
-	// (typical rank 5th).
-	embedDims = 768
 	// The model's window is 8,192 tokens; this keeps long entries well inside it.
 	maxDocChars = 24000
+	// Media vectors at full size. On a 20,000-entry test, 256 dims put a
+	// reworded question's answer first 2 times in 30; 768 did 10 in 30.
+	mediaDims = 768
 )
 
 // Each vector records the embedder that made it, and search compares only
 // vectors from the same one. Vectors from different embedders, or the same
 // model reached another way, are not comparable (measured: cosine 0.74-0.81
 // for one text sent two ways), and nothing else would catch the mix-up. A
-// text embedder is its model and the host serving it (embedderID).
-const mediaEmbedder = "workers-ai/embeddinggemma-2/768"
-
+// text embedder is its model and the host serving it.
+//
 // embedderID names a text embedder: the model and the host that serves it.
 func embedderID(base, model string) string {
 	host := base
@@ -97,23 +93,28 @@ func format(model string, in Input) string {
 //   - text embeddings: any OpenAI-compatible /embeddings API; by default
 //     Ollama on this machine.
 //   - chat, for captions, reranking and summaries: any OpenAI-compatible
-//     /chat/completions API; Cloudflare Workers AI when only its credentials
-//     are set.
-//   - raw media vectors (search --like): Workers AI's own API, which no
-//     standard covers.
+//     /chat/completions API.
+//   - a reranker with a Cohere-style /rerank API.
+//   - media vectors (search --like by look): Cloudflare Workers AI's own API.
 type AI struct {
 	embedURL, embedKey, embedModel, embedID string
-	embedSet                                bool // JR_EMBED_URL was given
+	embedSet                                bool // set by config or JR_EMBED_URL, not the Ollama default
 
 	chatURL, chatKey, chatModel string
+
+	// Vectors of the raw images, video and audio, for search --like. Only
+	// Cloudflare Workers AI is supported; without it, --like compares
+	// descriptions.
+	media    endpoint
+	mediaID  string
+	mediaErr error
+
+	from map[string]string // role: where it was set, for jr doctor
 
 	// A dedicated reranker with a Cohere-style /rerank API, optional.
 	rerankURL, rerankKey, rerankModel string
 	chatExtra                         map[string]any // merged into each chat request
 	chatErr                           error          // set when no chat API is set up
-
-	cfBase, cfToken string
-	cfErr           error // set when Workers AI credentials are missing
 
 	hc       *http.Client
 	attempts int
@@ -132,18 +133,15 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 
 // NewAI reads its settings from the environment:
 //
+//	(see config.go for config.toml; these variables override it)
 //	JR_EMBED_URL, JR_EMBED_KEY, JR_EMBED_MODEL  text embeddings
 //	    (default: Ollama at OLLAMA_HOST or localhost:11434, embeddinggemma-2)
 //	JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL     chat
 //	JR_CHAT_EXTRA                               JSON fields added to each chat request
 //	JR_RERANK_URL, JR_RERANK_KEY, JR_RERANK_MODEL  a reranker with a
 //	    Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel AI Gateway)
-//	CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN Workers AI: search --like, and
-//	    chat with Gemma 4 when JR_CHAT_URL is not set
 //	JR_ENV_FILE                                 more of these settings (see envFile)
-//
-// JR_AI_URL replaces the Workers AI root, .../accounts/<id>/ai (tests point
-// it at a local server).
+
 // ollamaURL is the OpenAI-compatible API of Ollama at OLLAMA_HOST.
 func ollamaURL() string {
 	host := os.Getenv("OLLAMA_HOST")
@@ -214,50 +212,32 @@ var loadEnvOnce sync.Once
 
 func NewAI() (*AI, error) {
 	loadEnvOnce.Do(func() { loadEnvFile(envFile(), 10*time.Second) })
-	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4}
+	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4, from: map[string]string{}}
+	c, err := loadConfig(configFile())
+	if err != nil {
+		return nil, err
+	}
 
-	e.embedURL = strings.TrimSuffix(os.Getenv("JR_EMBED_URL"), "/")
-	e.embedSet = e.embedURL != ""
+	emb, err := c.resolve("embed", c.Embed, "EMBED")
+	if err != nil {
+		return nil, err
+	}
+	e.embedURL, e.embedKey, e.embedModel, e.embedSet = emb.url, emb.key, emb.model, emb.url != ""
 	if !e.embedSet {
 		e.embedURL = ollamaURL()
 	}
-	e.embedKey = os.Getenv("JR_EMBED_KEY")
-	e.embedModel = os.Getenv("JR_EMBED_MODEL")
 	if e.embedModel == "" {
 		e.embedModel = ollamaModel
 	}
-	e.embedID = embedderID(e.embedURL, e.embedModel)
+	e.embedID, e.from["embed"] = embedderID(e.embedURL, e.embedModel), emb.from
 
-	root := os.Getenv("JR_AI_URL")
-	e.cfToken = os.Getenv("CLOUDFLARE_API_TOKEN")
-	if root == "" {
-		acct := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
-		if acct == "" || e.cfToken == "" {
-			e.cfErr = errNoWorkersAI
-		}
-		root = "https://api.cloudflare.com/client/v4/accounts/" + acct + "/ai"
+	chat, err := c.resolve("chat", c.Chat, "CHAT")
+	if err != nil {
+		return nil, err
 	}
-	e.cfBase = root + "/run"
-
-	e.chatURL = strings.TrimSuffix(os.Getenv("JR_CHAT_URL"), "/")
-	switch {
-	case e.chatURL != "":
-		e.chatKey, e.chatModel = os.Getenv("JR_CHAT_KEY"), os.Getenv("JR_CHAT_MODEL")
-		if e.chatModel == "" {
-			return nil, errors.New("JR_CHAT_URL is set, so set JR_CHAT_MODEL too")
-		}
-	case e.cfErr == nil:
-		// Gemma 4 on Workers AI. With thinking on, its reasoning used the
-		// whole token budget and the answer came back empty.
-		e.chatURL, e.chatKey, e.chatModel = root+"/v1", e.cfToken, captionModel
-		e.chatExtra = map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}
-	default:
+	e.chatURL, e.chatKey, e.chatModel, e.chatExtra, e.from["chat"] = chat.url, chat.key, chat.model, chat.extra, chat.from
+	if e.chatURL == "" {
 		e.chatErr = errNoChat
-	}
-	e.rerankURL = strings.TrimSuffix(os.Getenv("JR_RERANK_URL"), "/")
-	e.rerankKey, e.rerankModel = os.Getenv("JR_RERANK_KEY"), os.Getenv("JR_RERANK_MODEL")
-	if e.rerankURL != "" && e.rerankModel == "" {
-		return nil, errors.New("JR_RERANK_URL is set, so set JR_RERANK_MODEL too")
 	}
 	if x := os.Getenv("JR_CHAT_EXTRA"); x != "" {
 		e.chatExtra = nil
@@ -265,29 +245,28 @@ func NewAI() (*AI, error) {
 			return nil, fmt.Errorf("JR_CHAT_EXTRA must be a JSON object: %w", err)
 		}
 	}
+
+	rr, err := c.resolve("rerank", c.Rerank, "RERANK")
+	if err != nil {
+		return nil, err
+	}
+	e.rerankURL, e.rerankKey, e.rerankModel, e.from["rerank"] = rr.url, rr.key, rr.model, rr.from
+
+	if e.media, err = c.resolve("media_embed", c.MediaEmbed, ""); err != nil {
+		return nil, err
+	}
+	if e.media.run == "" {
+		e.mediaErr = errNoMediaEmbed
+	} else {
+		// Workers AI gives the same vectors on any account.
+		e.mediaID, e.from["media_embed"] = "cloudflare/"+e.media.model, e.media.from
+	}
 	return e, nil
 }
 
-type apiErrors struct {
-	Success bool `json:"success"`
-	Errors  []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
-}
-
-func (r apiErrors) err() error {
-	if r.Success {
-		return nil
-	}
-	var m []string
-	for _, er := range r.Errors {
-		m = append(m, er.Message)
-	}
-	return fmt.Errorf("workers ai: %s", strings.Join(m, "; "))
-}
-
-// Embed sends text to Ollama and media to Workers AI. The two kinds of vector
-// live in different spaces and are never compared with each other.
+// Embed sends text to the embeddings API and media files to the media
+// embedder. The two kinds of vector live in different spaces and are never
+// compared with each other.
 func (e *AI) Embed(ins []Input) ([][]float32, error) {
 	var texts, media []int
 	for i, in := range ins {
@@ -312,6 +291,9 @@ func (e *AI) Embed(ins []Input) ([][]float32, error) {
 		}
 	}
 	if len(media) > 0 {
+		if e.mediaErr != nil {
+			return nil, e.mediaErr
+		}
 		msgs := make([]any, len(media))
 		for j, i := range media {
 			content, err := messageContent(ins[i])
@@ -320,7 +302,7 @@ func (e *AI) Embed(ins []Input) ([][]float32, error) {
 			}
 			msgs[j] = []any{map[string]any{"role": "user", "content": content}}
 		}
-		vecs, err := e.embedRequest(map[string]any{"messages": msgs, "dimensions": embedDims}, len(media))
+		vecs, err := e.embedMedia(map[string]any{"messages": msgs, "dimensions": mediaDims}, len(media))
 		if err != nil {
 			return nil, err
 		}
@@ -329,6 +311,64 @@ func (e *AI) Embed(ins []Input) ([][]float32, error) {
 		}
 	}
 	return out, nil
+}
+
+// embedMedia calls Workers AI's own API, which takes images, video and audio
+// as data URIs. Text sent this way embeds differently from the same text
+// sent as "input" (cosine 0.74-0.81), so only files go here.
+func (e *AI) embedMedia(req map[string]any, n int) ([][]float32, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Success bool `json:"success"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+		Result struct {
+			Data []struct {
+				Index     int       `json:"index"`
+				Embedding []float32 `json:"embedding"`
+			} `json:"data"`
+		} `json:"result"`
+	}
+	if err := e.post(e.media.run+"/"+e.media.model, e.media.key, body, &res); err != nil {
+		return nil, fmt.Errorf("media embeddings: %w", err)
+	}
+	if !res.Success {
+		var m []string
+		for _, er := range res.Errors {
+			m = append(m, er.Message)
+		}
+		return nil, fmt.Errorf("media embeddings: %s", strings.Join(m, "; "))
+	}
+	out := make([][]float32, n)
+	for _, d := range res.Result.Data {
+		if d.Index >= 0 && d.Index < n {
+			out[d.Index] = normalize(d.Embedding)
+		}
+	}
+	for i, v := range out {
+		if len(v) == 0 {
+			return nil, fmt.Errorf("media embeddings: no vector for input %d", i)
+		}
+	}
+	return out, nil
+}
+
+func messageContent(in Input) (any, error) {
+	b, err := os.ReadFile(in.File)
+	if err != nil {
+		return nil, permanent{err}
+	}
+	uri := "data:" + in.Mime + ";base64," + base64.StdEncoding.EncodeToString(b)
+	for _, kind := range []string{"image", "video", "audio"} {
+		if strings.HasPrefix(in.Mime, kind+"/") {
+			return []any{map[string]any{"type": kind + "_url", kind + "_url": map[string]string{"url": uri}}}, nil
+		}
+	}
+	return nil, permanent{fmt.Errorf("cannot embed %s", in.Mime)}
 }
 
 func (e *AI) embedText(input []string) ([][]float32, error) {
@@ -359,45 +399,6 @@ func (e *AI) embedText(input []string) ([][]float32, error) {
 	for i, v := range out {
 		if len(v) == 0 {
 			return nil, fmt.Errorf("embeddings at %s: no vector for input %d", e.embedURL, i)
-		}
-	}
-	return out, nil
-}
-
-func (e *AI) embedRequest(req map[string]any, n int) ([][]float32, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-
-	var res struct {
-		apiErrors
-		Result struct {
-			Data []struct {
-				Index     int       `json:"index"`
-				Embedding []float32 `json:"embedding"`
-			} `json:"data"`
-		} `json:"result"`
-	}
-	if e.cfErr != nil {
-		return nil, e.cfErr
-	}
-	if err := e.post(e.cfBase+"/"+embedModel, e.cfToken, body, &res); err != nil {
-		return nil, err
-	}
-	if err := res.err(); err != nil {
-		return nil, err
-	}
-	out := make([][]float32, n)
-	for _, d := range res.Result.Data {
-		if d.Index < 0 || d.Index >= len(out) {
-			return nil, fmt.Errorf("workers ai: embedding index %d out of range", d.Index)
-		}
-		out[d.Index] = normalize(d.Embedding)
-	}
-	for i, v := range out {
-		if len(v) == 0 {
-			return nil, fmt.Errorf("workers ai: no embedding for input %d", i)
 		}
 	}
 	return out, nil
@@ -492,29 +493,8 @@ func apiMessage(data []byte) string {
 	return truncate(body, 300)
 }
 
-func messageContent(in Input) (any, error) {
-	if in.File == "" {
-		return in.Text, nil
-	}
-	b, err := os.ReadFile(in.File)
-	if err != nil {
-		return nil, permanent{err}
-	}
-	enc := base64.StdEncoding.EncodeToString(b)
-	uri := "data:" + in.Mime + ";base64," + enc
-	switch {
-	case strings.HasPrefix(in.Mime, "image/"):
-		return []any{map[string]any{"type": "image_url", "image_url": map[string]string{"url": uri}}}, nil
-	case strings.HasPrefix(in.Mime, "video/"):
-		return []any{map[string]any{"type": "video_url", "video_url": map[string]string{"url": uri}}}, nil
-	case strings.HasPrefix(in.Mime, "audio/"):
-		return []any{map[string]any{"type": "audio_url", "audio_url": map[string]string{"url": uri}}}, nil
-	}
-	return nil, permanent{fmt.Errorf("cannot embed %s", in.Mime)}
-}
-
-// Caption asks the chat model to describe one or more images (video frames are sent
-// as images; the Workers AI build of Gemma 4 takes text and images only).
+// Caption asks the chat model to describe one or more images. Video frames
+// are sent as images, which every vision chat model takes.
 func (e *AI) Caption(images []string, prompt string) (string, error) {
 	var content []any
 	for _, path := range images {
@@ -651,15 +631,14 @@ func (e *AI) rerankAPI(query string, items []string, k int) ([]int, error) {
 }
 
 // notSetUp marks a part of jr that this machine has not been set up for:
-// no chat API, no Workers AI credentials, no ffmpeg, no parakeet. The work
+// no chat API, no media embedder, no ffmpeg, no parakeet. The work
 // waits, quietly, for `jr reindex` after setup; `jr doctor` says how to turn
 // each part on.
 type notSetUp struct{ error }
 
 var (
-	errNoChat = notSetUp{errors.New("no chat model is set up (set JR_CHAT_URL, JR_CHAT_KEY and JR_CHAT_MODEL, " +
-		"or CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)")}
-	errNoWorkersAI = notSetUp{errors.New("Workers AI is not set up (set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)")}
+	errNoChat       = notSetUp{errors.New("no chat model is set up ([chat] in config.toml, or JR_CHAT_URL and JR_CHAT_MODEL)")}
+	errNoMediaEmbed = notSetUp{errors.New("no media embedder is set up ([media_embed] in config.toml)")}
 )
 
 // embedDown means nothing answered at the embeddings address. With no
@@ -674,7 +653,7 @@ type embedDown struct {
 
 func (d embedDown) Error() string {
 	if d.set {
-		return "nothing answers at JR_EMBED_URL " + d.addr
+		return "nothing answers at the embeddings URL " + d.addr
 	}
 	return "ollama is not reachable at " + strings.TrimSuffix(d.addr, "/v1") + " (start it with `ollama serve`)"
 }
@@ -693,9 +672,8 @@ func isPermanent(err error) bool {
 // input alone, so one bad attachment cannot block the others. Result i is
 // either vecs[i] or errs[i].
 //
-// Text (local Ollama) and media (Workers AI) are embedded separately with
-// separate errors, so a cloud outage never holds back text that Ollama has
-// already embedded.
+// Text and media are embedded separately with separate errors, so trouble
+// with the media embedder never holds back text.
 func (e *AI) EmbedEach(ins []Input) (vecs [][]float32, errs []error) {
 	vecs, errs = make([][]float32, len(ins)), make([]error, len(ins))
 	var text, media []int

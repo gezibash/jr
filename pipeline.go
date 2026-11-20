@@ -92,7 +92,7 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 		fmt.Fprintln(os.Stderr, "jr: attachment saved; captions and transcripts need setup (see `jr doctor`)")
 	}
 
-	ps, err := s.Pending(entryID, ai.embedID)
+	ps, err := s.Pending(entryID, ai.embedID, ai.mediaID)
 	if err != nil {
 		return r, err
 	}
@@ -108,7 +108,7 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 			case errs[i] == nil:
 				emb := ai.embedID
 				if p.in.File != "" {
-					emb = mediaEmbedder
+					emb = ai.mediaID
 				}
 				err = s.SetVec(p.chunkID, vecs[i], emb)
 				r.embedded++

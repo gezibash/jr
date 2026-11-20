@@ -164,6 +164,14 @@ func Open(project string) (*Store, error) {
 			return nil, fmt.Errorf("upgrade: %w", err)
 		}
 	}
+	if v > 0 && v < 4 {
+		// Before 4, media vectors were always Workers AI's EmbeddingGemma 2,
+		// named by a constant. Now they are named like text embedders.
+		if _, err := tx.Exec(`UPDATE chunks SET embedder = 'cloudflare/@cf/google/embeddinggemma-2'
+			WHERE embedder = 'workers-ai/embeddinggemma-2/768'`); err != nil {
+			return nil, fmt.Errorf("upgrade: %w", err)
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return nil, err
 	}
@@ -171,8 +179,8 @@ func Open(project string) (*Store, error) {
 }
 
 // 1: first release. 2: open/closed status on entries. 3: text embedders
-// named by model and host.
-const schemaVersion = 3
+// named by model and host. 4: media embedders named the same way.
+const schemaVersion = 4
 
 func addColumn(tx *sql.Tx, table, col, def string) error {
 	var n int
@@ -713,18 +721,23 @@ type pending struct {
 	in       Input
 }
 
-// Pending returns chunks of the entry (or all entries, for "") whose
-// embedding has not been computed yet, and text whose vector came from
-// another text embedder than textEmb: after a switch of embedding model,
-// reindex brings every entry back into search by meaning.
-func (s *Store) Pending(entryID, textEmb string) ([]pending, error) {
+// staleChunks matches chunks that need a vector from the current embedders:
+// none yet, or one from another model. Media chunks count only when a media
+// embedder is set up (mediaEmb != "").
+const staleChunks = `((c.modality IN ('text', 'caption') AND (c.vec IS NULL OR c.embedder != ?))
+	OR (? != '' AND c.modality NOT IN ('text', 'caption') AND (c.vec IS NULL OR c.embedder != ?))) AND c.error = ''`
+
+// Pending returns chunks of the entry (or all entries, for "") that need a
+// vector (staleChunks): after a switch of embedding model, reindex brings
+// every entry back into search by meaning.
+func (s *Store) Pending(entryID, textEmb, mediaEmb string) ([]pending, error) {
 	q := `SELECT c.id, c.modality, c.hash, e.title, e.body, COALESCE(a.ext, ''), COALESCE(a.mime, ''),
 			COALESCE(ea.name, ''), COALESCE(ea.caption, ''), COALESCE(a.description, '')
 		FROM chunks c JOIN entries e ON e.id = c.entry_id
 		LEFT JOIN assets a ON a.hash = c.hash AND c.hash != ''
 		LEFT JOIN entry_assets ea ON ea.entry_id = c.entry_id AND ea.hash = c.hash
-		WHERE (c.vec IS NULL OR (c.modality IN ('text', 'caption') AND c.embedder != ?)) AND c.error = ''`
-	args := []any{textEmb}
+		WHERE ` + staleChunks
+	args := []any{textEmb, mediaEmb, mediaEmb}
 	if entryID != "" {
 		q, args = q+` AND c.entry_id = ?`, append(args, entryID)
 	}
@@ -744,10 +757,9 @@ func (s *Store) Pending(entryID, textEmb string) ([]pending, error) {
 		case "text":
 			p.in, p.label = Input{Title: title, Text: body}, "entry text"
 		case "caption":
-			p.in, p.label = Input{Title: name, Text: strings.TrimSpace(caption + "\n" + desc)}, name+" description"
+			p.in, p.label = captionInput(name, caption, desc), name+" description"
 		default:
-			p.label = name
-			p.in = Input{File: s.assetPath(hash, ext), Mime: mt}
+			p.in, p.label = Input{File: s.assetPath(hash, ext), Mime: mt}, name
 		}
 		out = append(out, p)
 	}
@@ -764,12 +776,18 @@ func (s *Store) HasTextVectors() bool {
 
 // Waiting counts attachments not yet described and chunks Pending would
 // return, leaving out the ones that can never be done.
-func (s *Store) Waiting(textEmb string) (int, error) {
+func (s *Store) Waiting(textEmb, mediaEmb string) (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT
-		(SELECT COUNT(*) FROM chunks WHERE (vec IS NULL OR (modality IN ('text', 'caption') AND embedder != ?)) AND error = '') +
-		(SELECT COUNT(*) FROM assets WHERE description IS NULL AND describe_error = '')`, textEmb).Scan(&n)
+		(SELECT COUNT(*) FROM chunks c WHERE `+staleChunks+`) +
+		(SELECT COUNT(*) FROM assets WHERE description IS NULL AND describe_error = '')`, textEmb, mediaEmb, mediaEmb).Scan(&n)
 	return n, err
+}
+
+// captionInput is how an attachment's description is embedded, both when it
+// is stored and when search --like looks for one like it.
+func captionInput(name, caption, desc string) Input {
+	return Input{Title: name, Text: strings.TrimSpace(caption + "\n" + desc)}
 }
 
 func (s *Store) SetVec(chunkID int64, v []float32, embedder string) error {

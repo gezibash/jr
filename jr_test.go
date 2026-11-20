@@ -160,7 +160,7 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"success": true, "result": result})
 	}
 	switch {
-	case strings.HasSuffix(r.URL.Path, "/v1/chat/completions"): // OpenAI format, no envelope
+	case strings.HasSuffix(r.URL.Path, "/v1/chat/completions"):
 		reply := func(result any) { json.NewEncoder(w).Encode(result) }
 		body, _ := io.ReadAll(r.Body)
 		var sent map[string]any
@@ -278,39 +278,55 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type env struct {
-	t       *testing.T
-	home    string
-	ai      *fakeAI
-	url     string
-	ollama  string   // OLLAMA_HOST; the fake server unless a test changes it
-	noCloud bool     // no Workers AI credentials, like a fresh install
-	extra   []string // more environment, such as JR_CHAT_URL=...
-	path    string   // PATH for jr, when a test hides tools such as ffmpeg
+	t      *testing.T
+	home   string
+	ai     *fakeAI
+	url    string
+	ollama string   // OLLAMA_HOST; the fake server unless a test changes it
+	noChat bool     // no chat model set up, like a fresh install
+	config string   // config.toml; by default Cloudflare media vectors from the fake server
+	extra  []string // more environment, such as JR_CHAT_URL=...
+	path   string   // PATH for jr, when a test hides tools such as ffmpeg
 }
 
 func newEnv(t *testing.T) *env {
 	ai := &fakeAI{}
 	srv := httptest.NewServer(ai)
 	t.Cleanup(srv.Close)
-	return &env{t: t, home: t.TempDir(), ai: ai, url: srv.URL, ollama: srv.URL}
+	return &env{t: t, home: t.TempDir(), ai: ai, url: srv.URL, ollama: srv.URL, config: `
+[providers.cf]
+type = "cloudflare"
+url  = "` + srv.URL + `"
+key  = "env:JR_TEST_CF_KEY"
+
+[media_embed]
+provider = "cf"
+model    = "@cf/google/embeddinggemma-2"
+`}
 }
 
 func (e *env) run(stdin string, args ...string) (string, string, error) {
 	cmd := exec.Command(bin, append(args, "--project", "test")...)
-	cmd.Env = append(os.Environ(), "JR_HOME="+e.home, "JR_AI_URL="+e.url, "OLLAMA_HOST="+e.ollama,
+	cmd.Env = append(os.Environ(), "JR_HOME="+e.home, "OLLAMA_HOST="+e.ollama,
 		// A fixed clock and zone: Thursday 2026-11-19, 15:30 in Berlin (UTC+1).
 		"TZ=Europe/Berlin", "JR_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
 	// This machine's own settings must not leak in.
-	cmd.Env = append(cmd.Env, "JR_CHAT_URL=", "JR_CHAT_KEY=", "JR_CHAT_MODEL=", "JR_CHAT_EXTRA=",
-		"JR_EMBED_URL=", "JR_EMBED_KEY=", "JR_EMBED_MODEL=", "CLOUDFLARE_API_TOKEN=cf-test",
-		"JR_RERANK_URL=", "JR_RERANK_KEY=", "JR_RERANK_MODEL=", "JR_ENV_FILE="+filepath.Join(e.home, "no-env-file"))
+	cmd.Env = append(cmd.Env, "JR_CHAT_URL="+e.url+"/v1", "JR_CHAT_KEY=chat-test", "JR_CHAT_MODEL=test/vision",
+		"JR_CHAT_EXTRA=", "JR_EMBED_URL=", "JR_EMBED_KEY=", "JR_EMBED_MODEL=",
+		"JR_RERANK_URL=", "JR_RERANK_KEY=", "JR_RERANK_MODEL=", "JR_ENV_FILE="+filepath.Join(e.home, "no-env-file"),
+		"JR_TEST_CF_KEY=cf-test")
+	conf := filepath.Join(e.home, "config.toml")
+	os.Remove(conf)
+	if e.config != "" {
+		os.WriteFile(conf, []byte(e.config), 0o644)
+	}
+	cmd.Env = append(cmd.Env, "JR_CONFIG="+conf)
+	if e.noChat {
+		cmd.Env = append(cmd.Env, "JR_CHAT_URL=", "JR_CHAT_KEY=", "JR_CHAT_MODEL=")
+	}
 	cmd.Env = append(cmd.Env, e.extra...)
 	if e.path != "" {
 		cmd.Env = append(cmd.Env, "PATH="+e.path)
-	}
-	if e.noCloud {
-		// Blank, so this machine's own Cloudflare settings can't leak in.
-		cmd.Env = append(cmd.Env, "JR_AI_URL=", "CLOUDFLARE_ACCOUNT_ID=", "CLOUDFLARE_API_TOKEN=")
 	}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -477,7 +493,7 @@ func TestRejectedAttachmentDoesNotBlockOthers(t *testing.T) {
 		t.Fatalf("add: %v\n%s", err, errOut)
 	}
 	id := firstID(out)
-	if !strings.Contains(errOut, "clip.mp4 can't be embedded") {
+	if !strings.Contains(errOut, "clip.mp4 can't be embedded") || !strings.Contains(errOut, "clip.mp4 can't be described") {
 		t.Errorf("stderr should name the rejected video: %q", errOut)
 	}
 	if !strings.Contains(errOut, "notes.txt stored but not searchable") {
@@ -513,9 +529,36 @@ func TestRawMediaDoesNotDrownText(t *testing.T) {
 	if !strings.HasPrefix(out, login) {
 		t.Fatalf("text match should rank first, not the attachment hub:\n%s", out)
 	}
+	chats := len(e.ai.chatReqs)
 	out = e.must("", "search", "--like", img)
 	if !strings.HasPrefix(out, withImage) || strings.Contains(out, login) {
 		t.Fatalf("--like should return only the entry with a similar image:\n%s", out)
+	}
+	if len(e.ai.chatReqs) != chats {
+		t.Errorf("--like with a media embedder should compare vectors, not describe the file")
+	}
+}
+
+// Without a media embedder, --like describes the file and matches
+// attachment descriptions only: an entry whose text has the same words is
+// not an attachment like it.
+func TestSearchLike(t *testing.T) {
+	e := newEnv(t)
+	e.config = ""
+	dir := t.TempDir()
+	img, query := filepath.Join(dir, "chart.png"), filepath.Join(dir, "query.png")
+	os.WriteFile(img, []byte("\x89PNG quarterly chart"), 0o644)
+	os.WriteFile(query, []byte("\x89PNG quarterly chart"), 0o644)
+	withImage := firstID(e.must("Bumped the Go version.", "add", "--attach", img))
+	sameWords := firstID(e.must("A screenshot showing quarterly chart", "add"))
+
+	out := e.must("", "search", "--like", query)
+	if !strings.HasPrefix(out, withImage) || strings.Contains(out, sameWords) {
+		t.Fatalf("--like should return only the entry with a similar attachment:\n%s", out)
+	}
+	e.noChat = true
+	if _, errOut, err := e.run("", "search", "--like", query); err == nil || !strings.Contains(errOut, "no chat model") {
+		t.Errorf("--like without a chat model should say why it can't run: %v %q", err, errOut)
 	}
 }
 
@@ -663,12 +706,13 @@ func TestOllamaDown(t *testing.T) {
 	}
 }
 
-// A fresh install has no Ollama and no Workers AI. jr must work without a
+// A fresh install has no Ollama and no chat model. jr must work without a
 // word of setup noise, say how to get more only when it matters, and index
 // everything saved meanwhile once the parts are turned on.
 func TestFreshInstall(t *testing.T) {
 	e := newEnv(t)
-	e.ollama, e.noCloud = "http://127.0.0.1:1", true
+	media := e.config
+	e.ollama, e.noChat, e.config = "http://127.0.0.1:1", true, ""
 	e.path = t.TempDir() // a machine with none of the optional tools
 	img := filepath.Join(t.TempDir(), "shot.png")
 	os.WriteFile(img, []byte("\x89PNG settings page"), 0o644)
@@ -700,7 +744,8 @@ func TestFreshInstall(t *testing.T) {
 		t.Errorf("summarize should explain and point to jr list: %v, stderr %q", err, errOut)
 	}
 	doc := e.must("", "doctor")
-	for _, want := range []string{"2 entries", "4 item(s) waiting", "embedding  off", "chat       off", "CLOUDFLARE_API_TOKEN"} {
+	// Waiting: the text of both entries, and the image's description.
+	for _, want := range []string{"2 entries", "3 item(s) waiting", "embedding  off", "chat       off", "JR_CHAT_URL"} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("doctor is missing %q:\n%s", want, doc)
 		}
@@ -712,8 +757,8 @@ func TestFreshInstall(t *testing.T) {
 	os.WriteFile(memo, []byte("not really audio"), 0o644)
 	e.must("Voice memo.", "add", "--attach", memo)
 	e.must("", "reindex")
-	// 4 from before, plus the memo's text, its raw audio and its transcript.
-	if doc := e.must("", "doctor"); !strings.Contains(doc, "7 item(s) waiting") {
+	// 3 from before, plus the memo's text and its transcript.
+	if doc := e.must("", "doctor"); !strings.Contains(doc, "5 item(s) waiting") {
 		t.Errorf("audio without ffmpeg should stay waiting:\n%s", doc)
 	}
 
@@ -733,13 +778,18 @@ func TestFreshInstall(t *testing.T) {
 		t.Errorf("with Ollama on, search by meaning should work quietly; stderr %q:\n%s", errOut, out)
 	}
 
-	// Workers AI too: the attachment saved before setup gets described.
-	e.noCloud = false
+	// A chat model and a media embedder too: the attachment saved before
+	// setup gets described and its own vector.
+	e.noChat, e.config = false, media
 	if out := e.must("", "reindex"); !strings.Contains(out, "described 1 file(s)") {
-		t.Fatalf("reindex after Workers AI setup: %s", out)
+		t.Fatalf("reindex after chat setup: %s", out)
 	}
 	if out := e.must("", "search", "picture"); !strings.HasPrefix(out, imgID) {
 		t.Errorf("attachment not searchable after setup:\n%s", out)
+	}
+	chats := len(e.ai.chatReqs)
+	if out := e.must("", "search", "--like", img); !strings.HasPrefix(out, imgID) || len(e.ai.chatReqs) != chats {
+		t.Errorf("--like should find the attachment by its media vector after setup:\n%s", out)
 	}
 }
 
@@ -1047,8 +1097,7 @@ func TestSummarizeLongPeriodByDay(t *testing.T) {
 }
 
 // Any OpenAI-compatible chat API works: jr sends the configured model, key
-// and extra fields, and none of the Cloudflare preset's Gemma settings.
-// With only Cloudflare credentials, the preset is Gemma 4 with thinking off.
+// and extra fields.
 func TestAnyChatProvider(t *testing.T) {
 	e := newEnv(t)
 	img := filepath.Join(t.TempDir(), "shot.png")
@@ -1056,14 +1105,7 @@ func TestAnyChatProvider(t *testing.T) {
 	e.must("Login form rejects valid credentials.", "add")
 	e.must("rerank-me: Login is slow on Mondays.", "add")
 
-	e.must("", "search", "Login")
-	preset := e.ai.chatReqs[len(e.ai.chatReqs)-1]
-	thinking, _ := preset["chat_template_kwargs"].(map[string]any)
-	if preset["model"] != "@cf/google/gemma-4-26b-a4b-it" || preset["auth"] != "Bearer cf-test" || thinking["enable_thinking"] != false {
-		t.Errorf("Cloudflare preset: want Gemma 4, the Cloudflare token and thinking off, got %v", preset)
-	}
-
-	e.noCloud = true
+	e.noChat = true
 	e.extra = []string{"JR_CHAT_URL=" + e.url + "/v1/", "JR_CHAT_KEY=k-test", "JR_CHAT_MODEL=vendor/some-model",
 		`JR_CHAT_EXTRA={"reasoning_effort":"low"}`}
 	out, errOut, err := e.run("", "search", "Login")
@@ -1073,9 +1115,6 @@ func TestAnyChatProvider(t *testing.T) {
 	got := e.ai.chatReqs[len(e.ai.chatReqs)-1]
 	if got["model"] != "vendor/some-model" || got["auth"] != "Bearer k-test" || got["reasoning_effort"] != "low" {
 		t.Errorf("want the configured model, key and extra field, got %v", got)
-	}
-	if _, ok := got["chat_template_kwargs"]; ok {
-		t.Errorf("Gemma settings sent to another provider: %v", got)
 	}
 	if out := e.must("Settings page.", "add", "--attach", img); out == "" {
 		t.Fatal("no ID")
@@ -1114,22 +1153,35 @@ func TestSwitchEmbeddingModel(t *testing.T) {
 }
 
 // A journal from before schema 3 has vectors named by the old scheme. They
-// came from the same model and API, so they keep working without reindex.
-func TestUpgradeKeepsOllamaVectors(t *testing.T) {
+// came from the same models and APIs, so they keep working without reindex:
+// text from Ollama, and media from Workers AI (now a cloudflare provider).
+func TestUpgradeKeepsOldVectors(t *testing.T) {
 	e := newEnv(t)
-	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	img := filepath.Join(t.TempDir(), "chart.png")
+	os.WriteFile(img, []byte("\x89PNG quarterly chart"), 0o644)
+	id := firstID(e.must("Login form rejects valid credentials.", "add", "--attach", img))
 	db, err := sql.Open("sqlite", filepath.Join(e.home, "test", "journal.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{`UPDATE chunks SET embedder = 'ollama/embeddinggemma-2:270m/768'`, `PRAGMA user_version = 2`} {
+	for _, q := range []string{
+		`UPDATE chunks SET embedder = 'ollama/embeddinggemma-2:270m/768' WHERE modality IN ('text', 'caption')`,
+		`UPDATE chunks SET embedder = 'workers-ai/embeddinggemma-2/768' WHERE modality = 'image'`,
+		`PRAGMA user_version = 2`} {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
 	}
 	db.Close()
 	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
-		t.Fatalf("old vectors lost after the upgrade:\n%s", out)
+		t.Fatalf("old text vectors lost after the upgrade:\n%s", out)
+	}
+	chats := len(e.ai.chatReqs)
+	if out := e.must("", "search", "--like", img); !strings.HasPrefix(out, id) || len(e.ai.chatReqs) != chats {
+		t.Fatalf("old media vectors lost after the upgrade:\n%s", out)
+	}
+	if doc := e.must("", "doctor"); strings.Contains(doc, "waiting") {
+		t.Errorf("nothing should need embedding again after the upgrade:\n%s", doc)
 	}
 }
 
@@ -1157,7 +1209,7 @@ func TestTextFormatFollowsTheModel(t *testing.T) {
 func TestRerankAPI(t *testing.T) {
 	for _, model := range []string{"cohere/rerank-v5-fast", "voyage/rerank-3-lite"} {
 		e := newEnv(t)
-		e.noCloud = true // no chat model at all
+		e.noChat = true // no chat model at all
 		e.extra = []string{"JR_RERANK_URL=" + e.url + "/v1", "JR_RERANK_KEY=k", "JR_RERANK_MODEL=" + model}
 		e.must("Login form rejects valid credentials.", "add")
 		e.must("rerank-me: Login is slow on Mondays.", "add")
@@ -1188,7 +1240,7 @@ func TestKeysFromEnvFile(t *testing.T) {
 			}
 		}()
 	}
-	e.noCloud = true
+	e.noChat = true
 	e.extra = []string{"JR_ENV_FILE=" + pipe, "JR_CHAT_URL=" + e.url + "/v1"}
 
 	serve()
@@ -1216,5 +1268,69 @@ func TestEnvFileWithoutWriter(t *testing.T) {
 	loadEnvFile(pipe, 200*time.Millisecond)
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("waited %v for a pipe with no writer", d)
+	}
+}
+
+// config.toml picks each role's provider and model. JR_* variables win: a
+// lone model or key replaces that field, and a URL replaces the whole role,
+// so the file's key never goes to another URL.
+func TestConfigFile(t *testing.T) {
+	e := newEnv(t)
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("rerank-me: Login is slow on Mondays.", "add")
+	e.noChat = true
+	e.config = `
+[providers.gw]
+url = "` + e.url + `/v1"
+key = "env:MY_GATEWAY_KEY"
+
+[chat]
+provider = "gw"
+model    = "conf/model"
+extra    = { reasoning_effort = "low", kwargs = { thinking = false } }
+`
+	lastChat := func(env ...string) map[string]any {
+		t.Helper()
+		e.extra = append([]string{"MY_GATEWAY_KEY=k-conf"}, env...)
+		e.must("", "search", "Login")
+		return e.ai.chatReqs[len(e.ai.chatReqs)-1]
+	}
+	if got := lastChat(); got["model"] != "conf/model" || got["auth"] != "Bearer k-conf" || got["reasoning_effort"] != "low" ||
+		got["kwargs"].(map[string]any)["thinking"] != false {
+		t.Errorf("want the config's model, key and extra field, got %v", got)
+	}
+	if got := lastChat("JR_CHAT_MODEL=env/model"); got["model"] != "env/model" || got["auth"] != "Bearer k-conf" {
+		t.Errorf("JR_CHAT_MODEL alone should replace only the model, got %v", got)
+	}
+	if got := lastChat("JR_CHAT_URL="+e.url+"/v1", "JR_CHAT_MODEL=env/model"); got["auth"] == "Bearer k-conf" {
+		t.Errorf("the config's key went to the URL set by JR_CHAT_URL: %v", got)
+	}
+
+	e.extra = nil
+	for conf, want := range map[string]string{
+		"[providers.gw]\nurl = \"x\"\nkey = \"sk-123\"\n[chat]\nprovider = \"gw\"\nmodel = \"m\"\n":           "env:",
+		"[chat]\nprovider = \"gw\"\nmodle = \"m\"\n":                                                          "unknown setting",
+		"[providers.cf]\ntype = \"cloudflare\"\naccount = \"a\"\n[embed]\nprovider = \"cf\"\nmodel = \"m\"\n": "can't do embed",
+	} {
+		e.config = conf
+		if _, errOut, err := e.run("", "search", "Login"); err == nil || !strings.Contains(errOut, want) {
+			t.Errorf("config %q: want an error with %q, got %v %q", conf, want, err, errOut)
+		}
+	}
+}
+
+// The same embedding model at the same URL is the same embedder, whether
+// config.toml or JR_EMBED_* names it: switching must not re-embed anything.
+func TestConfigAndEnvNameTheSameEmbedder(t *testing.T) {
+	e := newEnv(t)
+	e.config = "[providers.o]\nurl = \"" + e.url + "/v1\"\n[embed]\nprovider = \"o\"\nmodel = \"emb-x\"\n"
+	id := firstID(e.must("Login form rejects valid credentials.", "add"))
+	e.config = ""
+	e.extra = []string{"JR_EMBED_URL=" + e.url + "/v1", "JR_EMBED_MODEL=emb-x"}
+	if doc := e.must("", "doctor"); strings.Contains(doc, "waiting") || !strings.Contains(doc, "emb-x") {
+		t.Errorf("switching from config to env should not need a reindex:\n%s", doc)
+	}
+	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
+		t.Errorf("not found by meaning after switching to env:\n%s", out)
 	}
 }

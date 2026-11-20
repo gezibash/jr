@@ -34,7 +34,7 @@ const usage = `jr — per-project journal
   jr list [filters]            newest first; --oldest for oldest first
   jr search [filters] QUERY    keyword + semantic search over entries and attachment descriptions
       --newest | --oldest      the latest / the first matches, instead of the best
-  jr search --like FILE        find attachments that look or sound like FILE
+  jr search --like FILE        find attachments whose description is like FILE's
   jr sessions [filters]        recent sessions: when, how many entries, last title
   jr stats [filters]           counts by kind, tag and author
   jr summarize [filters]       summary of a period, citing entry IDs; saved and reused
@@ -56,19 +56,18 @@ WHEN, in local time: today, yesterday, 3 days ago, monday, last monday,
 every command: --project P (default: from git remote, else directory name)
 
 jr works with no setup: entries, filters and keyword search. Optional parts,
-any of them through an OpenAI-compatible API:
-  search by meaning   JR_EMBED_URL, JR_EMBED_KEY, JR_EMBED_MODEL
+each a role in ~/.config/jr/config.toml (or JR_CONFIG) that names a provider
+and a model; see the README:
+  [embed]             search by meaning, any OpenAI-compatible API
                       (default: Ollama on this machine, embeddinggemma-2:270m)
-  reranking, summaries, captions
-                      JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL, and JR_CHAT_EXTRA
-                      for extra JSON fields (default with CLOUDFLARE_ACCOUNT_ID
-                      and CLOUDFLARE_API_TOKEN: Gemma 4 on Workers AI)
-  faster reranking    JR_RERANK_URL, JR_RERANK_KEY, JR_RERANK_MODEL: a
-                      Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel)
-  search --like       CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN
+  [chat]              reranking, summaries, captions (a model that reads images)
+  [rerank]            faster reranking: a Cohere-style /rerank API
+  [media_embed]       search --like by look and sound (Cloudflare Workers AI);
+                      without it, --like compares descriptions
   audio transcripts   parakeet-mlx through mise or uvx (Apple silicon)
-Settings not in the environment are read from JR_ENV_FILE (default
-~/.config/jr/.env), which can be a 1Password Environment mounted as a .env file.
+JR_<ROLE>_URL, _KEY and _MODEL (ROLE: EMBED, CHAT, RERANK) and JR_CHAT_EXTRA
+override the file. Keys come from variables, which jr also reads from
+JR_ENV_FILE (default ~/.config/jr/.env), such as a mounted 1Password Environment.
 jr doctor shows which are on. jr reindex indexes what was saved before setup.
 `
 
@@ -106,9 +105,9 @@ func main() {
 // version is set at release build time: -ldflags "-X main.version=1.0.0".
 var version = "dev"
 
-// Raw media vectors serve only search --like. Embedding a 941 MB video
-// peaked at 7.6 GB of memory before Workers AI rejected it with 413, while
-// 52 MB went through.
+// Media vectors serve only search --like. Embedding a 941 MB video peaked
+// at 7.6 GB of memory before Workers AI rejected it with 413, while 52 MB
+// went through. Larger files are matched by their description.
 const maxRawBytes = 50 << 20
 
 // Search deadlines. Past them, search falls back to keyword-only results
@@ -254,12 +253,9 @@ func cmdAdd(args []string) error {
 	// the write lock, and anything that fails stays queued for `jr reindex`.
 	chunks := []Chunk{{Modality: "text"}}
 	for _, a := range e.Assets {
-		if m := a.Modality(); m != "" && a.Bytes > maxRawBytes {
-			// Its description is still made and searched; only --like misses it.
-			fmt.Fprintf(os.Stderr, "jr: %s is over %d MB, so search --like won't match it\n", a.Name, maxRawBytes>>20)
-		} else if m != "" {
+		if m := a.Modality(); m != "" && a.Bytes <= maxRawBytes {
 			chunks = append(chunks, Chunk{Hash: a.Hash, Modality: m})
-		} else {
+		} else if m == "" {
 			fmt.Fprintf(os.Stderr, "jr: %s stored but not searchable by content (%s is not image, video or audio)\n", a.Name, a.Mime)
 		}
 	}
@@ -486,26 +482,32 @@ func cmdSearch(args []string) error {
 		return err
 	}
 	var qvec []float32
-	// Text queries rank entry text and attachment descriptions. --like ranks
-	// raw media of the same kind: vectors compare well within one modality,
-	// not across them.
 	ai, err := NewAI()
 	if err != nil {
 		return err
 	}
+	// Text queries rank entry text and attachment descriptions. --like ranks
+	// media of the same kind by their vectors when a media embedder is set
+	// up (vectors compare well within one modality, not across them).
+	// Without one, it describes the file the way attachments are described
+	// and ranks the descriptions most like it.
 	in, modalities, embedder := Input{Text: q, Query: true}, []string{"text", "caption"}, ai.embedID
+	client := ai.Interactive(embedDeadline)
 	if *like != "" {
-		a := Asset{Mime: mediaTypes[strings.ToLower(filepath.Ext(*like))]}
+		a := Asset{Path: *like, Name: filepath.Base(*like), Mime: mediaTypes[strings.ToLower(filepath.Ext(*like))]}
 		if a.Modality() == "" {
 			return fmt.Errorf("--like needs an image, video or audio file")
 		}
-		in, modalities, embedder, q = Input{File: *like, Mime: a.Mime}, []string{a.Modality()}, mediaEmbedder, ""
-	}
-	// A text query embeds in ~40 ms on Ollama, so it gets a deadline; a
-	// --like file goes to Workers AI and a video can take ~10 s.
-	client := ai.Interactive(embedDeadline)
-	if *like != "" {
-		client = ai
+		if ai.mediaErr == nil {
+			in, modalities, embedder = Input{File: a.Path, Mime: a.Mime}, []string{a.Modality()}, ai.mediaID
+		} else {
+			desc, err := ai.Describe(a)
+			if err != nil {
+				return fmt.Errorf("--like: %w", err)
+			}
+			in, modalities = captionInput(a.Name, "", desc), []string{"caption"}
+		}
+		q, client = "", ai
 	}
 	vecs, aiErr := client.Embed([]Input{in})
 	if aiErr == nil {
@@ -859,7 +861,7 @@ func cmdDoctor(args []string) error {
 	if err != nil {
 		return err
 	}
-	waiting, err := s.Waiting(ai.embedID)
+	waiting, err := s.Waiting(ai.embedID, ai.mediaID)
 	if err != nil {
 		return err
 	}
@@ -884,23 +886,35 @@ func cmdDoctor(args []string) error {
 	fmt.Println()
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
 
+	// where says which setting chose a role, when it wasn't a default.
+	where := func(role string) string {
+		if f := ai.from[role]; f != "" {
+			return " (" + f + ")"
+		}
+		return ""
+	}
+	if _, err := os.Stat(configFile()); err == nil {
+		fmt.Printf("%-10s %s\n", "config", configFile())
+	}
 	embedOn, how := embedStatus(ai)
+	if embedOn {
+		how += where("embed")
+	}
 	row("embedding", embedOn, "search by meaning, not only exact words", how)
-	how = "an OpenAI-compatible API: JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL; " +
-		"or Cloudflare: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN"
+	how = "[chat] in " + configFile() + ", or JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL"
 	if ai.chatErr == nil {
-		how = ai.chatModel + " at " + ai.chatURL
+		how = ai.chatModel + " at " + ai.chatURL + where("chat")
 	}
 	row("chat", ai.chatErr == nil, "reranking, summaries, captions for images and video", how)
 	if ai.rerankURL != "" {
 		row("reranker", true, "ranks search results; chat still answers --newest and --oldest",
-			ai.rerankModel+" at "+ai.rerankURL)
+			ai.rerankModel+" at "+ai.rerankURL+where("rerank"))
 	}
-	how = ""
-	if ai.cfErr != nil {
-		how = "set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
+	how = "[media_embed] with a cloudflare provider in config.toml; until then --like compares descriptions"
+	if ai.mediaErr == nil {
+		how = ai.media.model + " at " + ai.media.run + where("media_embed")
 	}
-	row("--like", ai.cfErr == nil, "find attachments that look or sound alike (Cloudflare Workers AI)", how)
+	row("--like", ai.mediaErr == nil, "find attachments that look or sound alike", how)
 	_, ffErr := exec.LookPath("ffmpeg")
 	how = ""
 	if ffErr != nil {
@@ -934,7 +948,7 @@ func embedStatus(ai *AI) (bool, string) {
 	var down embedDown
 	if errors.As(err, &down) && !down.set {
 		return false, "install Ollama (ollama.com), run `ollama serve`, then `ollama pull " + ollamaModel +
-			"`; or set JR_EMBED_URL, JR_EMBED_KEY and JR_EMBED_MODEL for any OpenAI-compatible API"
+			"`; or set [embed] in config.toml (or JR_EMBED_URL, JR_EMBED_MODEL) for any OpenAI-compatible API"
 	}
 	return false, err.Error()
 }

@@ -31,34 +31,68 @@ Each optional part adds more. Turn them on in any order, whenever you like:
 | Adds | Needs |
 |---|---|
 | Search by meaning | An embedding model. Default: [Ollama](https://ollama.com) on this machine with `ollama pull embeddinggemma-2:270m` |
-| Reranking, captions, summaries | A chat model that takes images. Default, when `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are set: Gemma 4 on Cloudflare Workers AI |
-| `search --like` (attachments that look or sound alike) | Cloudflare Workers AI |
+| Reranking, captions, summaries | A chat model that takes images |
+| Faster reranking | A reranker with a Cohere-style `/rerank` API (Cohere, Voyage, Jina, or any of them through Vercel AI Gateway) |
+| `search --like` by look and sound | Media embeddings from Cloudflare Workers AI. Without them, `--like` compares descriptions, which needs the chat model |
 | Video and audio attachments | `ffmpeg`; audio transcription uses `parakeet-mlx` through `uvx` (Apple silicon) |
 
-The embedding and chat models can come from any service with an
-OpenAI-compatible API: OpenAI, Vercel AI Gateway, OpenRouter, Cloudflare,
-Ollama, LM Studio, vLLM and others. Give each a base URL, a key and a model:
+Set them up in `~/.config/jr/config.toml` (or `JR_CONFIG`). Providers say
+where a service is; each role picks a provider and a model:
 
-```bash
-JR_EMBED_URL=https://api.openai.com/v1  JR_EMBED_KEY=…  JR_EMBED_MODEL=text-embedding-3-small
-JR_CHAT_URL=https://ai-gateway.vercel.sh/v1  JR_CHAT_KEY=…  JR_CHAT_MODEL=google/gemini-3-flash
-JR_CHAT_EXTRA='{"reasoning_effort":"low"}'   # optional JSON fields added to each chat request
+```toml
+[providers.vercel]
+type = "openai"                       # any OpenAI-compatible API (the default)
+url  = "https://ai-gateway.vercel.sh/v1"
+key  = "env:AI_GATEWAY_API_KEY"       # the variable that holds the key
+
+[providers.cloudflare]
+type    = "cloudflare"                # Workers AI: chat and media embeddings
+account = "env:CLOUDFLARE_ACCOUNT_ID" # the ID, or a variable
+key     = "env:CLOUDFLARE_API_TOKEN"
+
+[embed]
+provider = "vercel"
+model    = "alibaba/qwen3-embedding-4b"
+
+[rerank]
+provider = "vercel"
+model    = "voyage/rerank-3-lite"
+
+[chat]
+provider = "vercel"
+model    = "google/gemma-4-26b-a4b-it"
+extra    = { reasoning_effort = "none" }   # JSON fields added to each chat request
+
+[media_embed]
+provider = "cloudflare"
+model    = "@cf/google/embeddinggemma-2"
 ```
 
-`jr doctor` shows which parts are on, which models they use, and how to turn
-on the rest. After turning one on, or switching embedding model, `jr reindex`
-indexes everything saved before. Vectors from different embedding models are
-never compared.
+OpenAI, Vercel AI Gateway, OpenRouter, Ollama, LM Studio, vLLM and others
+work as `openai` providers. The file holds no keys, only the names of the
+variables that do, so it can go in a public dotfiles repository. jr refuses
+settings it doesn't know, so a typo can't quietly turn a part off.
 
-A dedicated reranker with a Cohere-style `/rerank` API is faster than asking a
-chat model (`JR_RERANK_URL`, `JR_RERANK_KEY`, `JR_RERANK_MODEL`; Cohere,
-Voyage, Jina, or any of them through Vercel AI Gateway).
+Variables win over the file: `JR_EMBED_*`, `JR_CHAT_*` and `JR_RERANK_*`
+(`_URL`, `_KEY`, `_MODEL`), and `JR_CHAT_EXTRA`. A `_URL` replaces the whole
+role with an OpenAI-compatible API, so the file's key is never sent to it; a
+`_MODEL` or `_KEY` alone replaces just that.
+
+Keys that are not in the environment are read from `~/.config/jr/.env` (or
+`JR_ENV_FILE`), one `KEY=value` per line. That file can be a
+[1Password Environment](https://www.1password.dev/environments/local-env-file)
+mounted as a local `.env` file, so keys never sit on disk.
+
+`jr doctor` shows which parts are on, which models they use, where each was
+set, and how to turn on the rest. After turning one on, or switching
+embedding model, `jr reindex` indexes everything saved before. Vectors from
+different embedding models are never compared.
 
 Measured on the same 20,000 entries and 30 reworded questions:
 
 | Embeddings + reranker | Right entry first | Median / slowest 5% | Notes |
 |---|---|---|---|
-| EmbeddingGemma 2 (local) + Gemma 4 (Workers AI) | 22 of 30 | 0.8 s / 4.2 s | the default |
+| EmbeddingGemma 2 (local) + Gemma 4 (Workers AI) | 22 of 30 | 0.8 s / 4.2 s | |
 | EmbeddingGemma 2 (local) + Voyage rerank-3-lite | 22 of 30 | 0.56 s / 0.73 s | fastest |
 | Qwen3-Embedding-4B (local) + Gemma 4 | 24 of 30 | 0.93 s / 1.8 s | 8.8 GB of memory in Ollama |
 | Qwen3-Embedding-4B (Vercel) + Voyage rerank-3-lite | 25 of 30 | 1.3 s / 2.2 s | best answers |
