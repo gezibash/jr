@@ -63,6 +63,8 @@ any of them through an OpenAI-compatible API:
                       JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL, and JR_CHAT_EXTRA
                       for extra JSON fields (default with CLOUDFLARE_ACCOUNT_ID
                       and CLOUDFLARE_API_TOKEN: Gemma 4 on Workers AI)
+  faster reranking    JR_RERANK_URL, JR_RERANK_KEY, JR_RERANK_MODEL: a
+                      Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel)
   search --like       CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN
   audio transcripts   parakeet-mlx through mise or uvx (Apple silicon)
 jr doctor shows which are on. jr reindex indexes what was saved before setup.
@@ -489,7 +491,7 @@ func cmdSearch(args []string) error {
 	if err != nil {
 		return err
 	}
-	in, modalities, embedder := Input{Text: queryText(q)}, []string{"text", "caption"}, ai.embedID
+	in, modalities, embedder := Input{Text: q, Query: true}, []string{"text", "caption"}, ai.embedID
 	if *like != "" {
 		a := Asset{Mime: mediaTypes[strings.ToLower(filepath.Ext(*like))]}
 		if a.Modality() == "" {
@@ -888,6 +890,10 @@ func cmdDoctor(args []string) error {
 		how = ai.chatModel + " at " + ai.chatURL
 	}
 	row("chat", ai.chatErr == nil, "reranking, summaries, captions for images and video", how)
+	if ai.rerankURL != "" {
+		row("reranker", true, "ranks search results; chat still answers --newest and --oldest",
+			ai.rerankModel+" at "+ai.rerankURL)
+	}
 	how = ""
 	if ai.cfErr != nil {
 		how = "set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"

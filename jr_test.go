@@ -62,6 +62,7 @@ type fakeAI struct {
 	rerankFail   atomic.Bool  // reranking calls answer 500
 	rerankDelay  atomic.Int64 // reranking calls stall this many seconds first
 	summaryCalls atomic.Int64
+	rerankCalls  atomic.Int64 // calls to the /rerank API
 	mu           sync.Mutex
 	texts        []string
 	dims         []int
@@ -107,6 +108,29 @@ func (f *fakeAI) vector(content any) []float32 {
 func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.requests.Add(1)
 	// fail and unauth model cloud trouble; Ollama is local and unaffected.
+	if r.URL.Path == "/v1/rerank" { // Cohere-style; "voyage" models answer like Voyage
+		var req struct {
+			Model     string   `json:"model"`
+			Query     string   `json:"query"`
+			Documents []string `json:"documents"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		f.rerankCalls.Add(1)
+		var scores []map[string]any
+		for i, d := range req.Documents {
+			score := 0.1
+			if strings.Contains(d, "rerank-me") {
+				score = 0.9
+			}
+			scores = append(scores, map[string]any{"index": i, "relevance_score": score})
+		}
+		key := "results"
+		if strings.HasPrefix(req.Model, "voyage") {
+			key = "data"
+		}
+		json.NewEncoder(w).Encode(map[string]any{key: scores})
+		return
+	}
 	if r.URL.Path == "/v1/embeddings" { // Ollama's OpenAI-compatible API
 		var req struct {
 			Model string   `json:"model"`
@@ -1104,5 +1128,41 @@ func TestUpgradeKeepsOllamaVectors(t *testing.T) {
 	db.Close()
 	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
 		t.Fatalf("old vectors lost after the upgrade:\n%s", out)
+	}
+}
+
+// Each embedding model gets text in the format its model card asks for:
+// Qwen3 wants an instruction on the query and the document plain; models
+// jr knows nothing about get plain text.
+func TestTextFormatFollowsTheModel(t *testing.T) {
+	for model, want := range map[string][2]string{
+		"qwen3-embedding:0.6b":   {"Instruct: ", "Login\n\nLogin form rejects valid credentials."},
+		"text-embedding-3-small": {"authentication problem", "Login\n\nLogin form rejects valid credentials."},
+	} {
+		e := newEnv(t)
+		e.extra = []string{"JR_EMBED_MODEL=" + model}
+		e.must("Login form rejects valid credentials.", "add", "--title", "Login")
+		e.must("", "search", "authentication problem")
+		got := strings.Join(e.ai.texts, "\n---\n")
+		if !strings.Contains(got, "\n---\n"+want[0]) && !strings.HasPrefix(got, want[0]) || !strings.Contains(got, want[1]) || strings.Contains(got, "title: ") {
+			t.Errorf("%s: want query starting %q and document %q, got:\n%s", model, want[0], want[1], got)
+		}
+	}
+}
+
+// A dedicated reranker (Cohere-style /rerank, in Cohere's or Voyage's reply
+// shape) orders search results without any chat model.
+func TestRerankAPI(t *testing.T) {
+	for _, model := range []string{"cohere/rerank-v5-fast", "voyage/rerank-3-lite"} {
+		e := newEnv(t)
+		e.noCloud = true // no chat model at all
+		e.extra = []string{"JR_RERANK_URL=" + e.url + "/v1", "JR_RERANK_KEY=k", "JR_RERANK_MODEL=" + model}
+		e.must("Login form rejects valid credentials.", "add")
+		e.must("rerank-me: Login is slow on Mondays.", "add")
+		out, errOut, err := e.run("", "search", "Login")
+		if err != nil || errOut != "" || !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") || e.ai.rerankCalls.Load() != 1 {
+			t.Errorf("%s: want the reranker's pick first, quietly, from 1 call (made %d); stderr %q:\n%s",
+				model, e.ai.rerankCalls.Load(), errOut, out)
+		}
 	}
 }

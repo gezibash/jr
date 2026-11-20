@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -54,22 +55,42 @@ func embedderID(base, model string) string {
 	return model + "@" + host
 }
 
-// Input is one thing to embed: text, or a media file.
+// Input is one thing to embed: a document (Title and Text), a search query
+// (Query set), or a media file.
 type Input struct {
-	Text       string
-	File, Mime string
+	Title, Text string
+	Query       bool
+	File, Mime  string
 }
 
-// Task prefixes from the EmbeddingGemma 2 model card. Media gets no prefix.
-func docText(title, body string) string {
-	t := "title: " + title + " | text: " + body
+// format writes text the way the embedding model was trained to read it.
+// Each family has its own convention, from its model card.
+func format(model string, in Input) string {
+	m := strings.ToLower(model)
+	var t string
+	switch {
+	case strings.Contains(m, "embeddinggemma"):
+		t = "title: " + in.Title + " | text: " + in.Text
+		if in.Query {
+			t = "task: search result | query: " + in.Text
+		}
+	case strings.Contains(m, "qwen3-embedding"):
+		// Qwen3 instructs the query and leaves the document plain.
+		t = in.Title + "\n\n" + in.Text
+		if in.Query {
+			t = "Instruct: Given a question about a software project, retrieve the journal entries that answer it\nQuery: " + in.Text
+		}
+	default:
+		t = in.Title + "\n\n" + in.Text
+		if in.Query {
+			t = in.Text
+		}
+	}
 	if len(t) > maxDocChars {
 		t = t[:maxDocChars]
 	}
 	return t
 }
-
-func queryText(q string) string { return "task: search result | query: " + q }
 
 // AI reaches the models jr uses, all optional:
 //   - text embeddings: any OpenAI-compatible /embeddings API; by default
@@ -84,8 +105,11 @@ type AI struct {
 	embedSet                                bool // JR_EMBED_URL was given
 
 	chatURL, chatKey, chatModel string
-	chatExtra                   map[string]any // merged into each chat request
-	chatErr                     error          // set when no chat API is set up
+
+	// A dedicated reranker with a Cohere-style /rerank API, optional.
+	rerankURL, rerankKey, rerankModel string
+	chatExtra                         map[string]any // merged into each chat request
+	chatErr                           error          // set when no chat API is set up
 
 	cfBase, cfToken string
 	cfErr           error // set when Workers AI credentials are missing
@@ -111,6 +135,8 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 //	    (default: Ollama at OLLAMA_HOST or localhost:11434, embeddinggemma-2)
 //	JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL     chat
 //	JR_CHAT_EXTRA                               JSON fields added to each chat request
+//	JR_RERANK_URL, JR_RERANK_KEY, JR_RERANK_MODEL  a reranker with a
+//	    Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel AI Gateway)
 //	CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN Workers AI: search --like, and
 //	    chat with Gemma 4 when JR_CHAT_URL is not set
 //
@@ -169,6 +195,11 @@ func NewAI() (*AI, error) {
 	default:
 		e.chatErr = errNoChat
 	}
+	e.rerankURL = strings.TrimSuffix(os.Getenv("JR_RERANK_URL"), "/")
+	e.rerankKey, e.rerankModel = os.Getenv("JR_RERANK_KEY"), os.Getenv("JR_RERANK_MODEL")
+	if e.rerankURL != "" && e.rerankModel == "" {
+		return nil, errors.New("JR_RERANK_URL is set, so set JR_RERANK_MODEL too")
+	}
 	if x := os.Getenv("JR_CHAT_EXTRA"); x != "" {
 		e.chatExtra = nil
 		if err := json.Unmarshal([]byte(x), &e.chatExtra); err != nil {
@@ -211,7 +242,7 @@ func (e *AI) Embed(ins []Input) ([][]float32, error) {
 	if len(texts) > 0 {
 		input := make([]string, len(texts))
 		for j, i := range texts {
-			input[j] = ins[i].Text
+			input[j] = format(e.embedModel, ins[i])
 		}
 		vecs, err := e.embedText(input)
 		if err != nil {
@@ -487,6 +518,11 @@ func (e *AI) chat(content any, maxTokens int) (string, error) {
 // then sorts those by date. Asking for the 5 best of ~60 near-identical
 // matches and sorting those missed the newest one on the 20,000-entry test.
 func (e *AI) Rerank(query string, items []string, k int) ([]int, error) {
+	// A dedicated reranker scores every candidate, but can't say that none
+	// of them answers; "every relevant entry" (k <= 0) stays with chat.
+	if e.rerankURL != "" && k > 0 {
+		return e.rerankAPI(query, items, k)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Query: %s\n\nJournal entries:\n", query)
 	for i, it := range items {
@@ -516,6 +552,37 @@ func (e *AI) Rerank(query string, items []string, k int) ([]int, error) {
 	// entry test it came back when the right entry was not among them.
 	if len(order) == 0 && strings.TrimSpace(out) != "[]" {
 		return nil, fmt.Errorf("reranker gave no usable order: %q", truncate(out, 120))
+	}
+	return order, nil
+}
+
+// rerankAPI calls a Cohere-style /rerank endpoint. Cohere, Jina and Vercel
+// answer with "results", Voyage with "data"; both carry index and score.
+func (e *AI) rerankAPI(query string, items []string, k int) ([]int, error) {
+	body, _ := json.Marshal(map[string]any{"model": e.rerankModel, "query": query, "documents": items})
+	type scored struct {
+		Index int     `json:"index"`
+		Score float64 `json:"relevance_score"`
+	}
+	var res struct {
+		Results []scored `json:"results"`
+		Data    []scored `json:"data"`
+	}
+	if err := e.post(e.rerankURL+"/rerank", e.rerankKey, body, &res); err != nil {
+		return nil, fmt.Errorf("rerank at %s: %w", e.rerankURL, err)
+	}
+	got := append(res.Results, res.Data...)
+	if len(got) == 0 {
+		return nil, fmt.Errorf("rerank at %s: no scores", e.rerankURL)
+	}
+	sort.SliceStable(got, func(a, b int) bool { return got[a].Score > got[b].Score })
+	var order []int
+	seen := map[int]bool{}
+	for _, g := range got {
+		if g.Index >= 0 && g.Index < len(items) && !seen[g.Index] && len(order) < k {
+			seen[g.Index] = true
+			order = append(order, g.Index)
+		}
 	}
 	return order, nil
 }

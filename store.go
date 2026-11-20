@@ -742,9 +742,9 @@ func (s *Store) Pending(entryID, textEmb string) ([]pending, error) {
 		}
 		switch p.modality {
 		case "text":
-			p.in, p.label = Input{Text: docText(title, body)}, "entry text"
+			p.in, p.label = Input{Title: title, Text: body}, "entry text"
 		case "caption":
-			p.in, p.label = Input{Text: docText(name, strings.TrimSpace(caption+"\n"+desc))}, name+" description"
+			p.in, p.label = Input{Title: name, Text: strings.TrimSpace(caption + "\n" + desc)}, name+" description"
 		default:
 			p.label = name
 			p.in = Input{File: s.assetPath(hash, ext), Mime: mt}
