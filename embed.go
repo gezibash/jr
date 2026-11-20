@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -139,6 +140,7 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 //	    Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel AI Gateway)
 //	CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN Workers AI: search --like, and
 //	    chat with Gemma 4 when JR_CHAT_URL is not set
+//	JR_ENV_FILE                                 more of these settings (see envFile)
 //
 // JR_AI_URL replaces the Workers AI root, .../accounts/<id>/ai (tests point
 // it at a local server).
@@ -154,7 +156,64 @@ func ollamaURL() string {
 	return strings.TrimSuffix(host, "/") + "/v1"
 }
 
+// envFile is where jr looks for API keys that are not in the environment:
+// JR_ENV_FILE, or ~/.config/jr/.env. It can be a 1Password Environment
+// mounted as a local .env file, which is a named pipe.
+func envFile() string {
+	if p := os.Getenv("JR_ENV_FILE"); p != "" {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "jr", ".env")
+}
+
+// loadEnvFile sets each KEY=VALUE from the file that the environment does
+// not already set. A missing file is fine. A named pipe whose writer does not
+// answer within wait (1Password closed, or its prompt not yet approved) is
+// skipped with a warning, so jr still saves entries, without the keys.
+func loadEnvFile(path string, wait time.Duration) {
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		data, err := os.ReadFile(path)
+		done <- result{data, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(wait):
+		r.err = fmt.Errorf("no answer in %v; is 1Password unlocked, and was its prompt approved?", wait)
+	}
+	if r.err != nil {
+		fmt.Fprintf(os.Stderr, "jr: skipped %s: %v\n", path, r.err)
+		return
+	}
+	for _, line := range strings.Split(string(r.data), "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
+var loadEnvOnce sync.Once
+
 func NewAI() (*AI, error) {
+	loadEnvOnce.Do(func() { loadEnvFile(envFile(), 10*time.Second) })
 	e := &AI{hc: &http.Client{Timeout: 3 * time.Minute}, attempts: 4}
 
 	e.embedURL = strings.TrimSuffix(os.Getenv("JR_EMBED_URL"), "/")

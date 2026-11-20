@@ -67,6 +67,8 @@ any of them through an OpenAI-compatible API:
                       Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel)
   search --like       CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN
   audio transcripts   parakeet-mlx through mise or uvx (Apple silicon)
+Settings not in the environment are read from JR_ENV_FILE (default
+~/.config/jr/.env), which can be a 1Password Environment mounted as a .env file.
 jr doctor shows which are on. jr reindex indexes what was saved before setup.
 `
 

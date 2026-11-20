@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -301,7 +302,8 @@ func (e *env) run(stdin string, args ...string) (string, string, error) {
 		"TZ=Europe/Berlin", "JR_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
 	// This machine's own settings must not leak in.
 	cmd.Env = append(cmd.Env, "JR_CHAT_URL=", "JR_CHAT_KEY=", "JR_CHAT_MODEL=", "JR_CHAT_EXTRA=",
-		"JR_EMBED_URL=", "JR_EMBED_KEY=", "JR_EMBED_MODEL=", "CLOUDFLARE_API_TOKEN=cf-test")
+		"JR_EMBED_URL=", "JR_EMBED_KEY=", "JR_EMBED_MODEL=", "CLOUDFLARE_API_TOKEN=cf-test",
+		"JR_RERANK_URL=", "JR_RERANK_KEY=", "JR_RERANK_MODEL=", "JR_ENV_FILE="+filepath.Join(e.home, "no-env-file"))
 	cmd.Env = append(cmd.Env, e.extra...)
 	if e.path != "" {
 		cmd.Env = append(cmd.Env, "PATH="+e.path)
@@ -1164,5 +1166,55 @@ func TestRerankAPI(t *testing.T) {
 			t.Errorf("%s: want the reranker's pick first, quietly, from 1 call (made %d); stderr %q:\n%s",
 				model, e.ai.rerankCalls.Load(), errOut, out)
 		}
+	}
+}
+
+// Keys can come from a .env file, such as a 1Password Environment mounted as
+// a named pipe. The environment still wins over the file.
+func TestKeysFromEnvFile(t *testing.T) {
+	e := newEnv(t)
+	e.must("Login form rejects valid credentials.", "add")
+	e.must("rerank-me: Login is slow on Mondays.", "add")
+	pipe := filepath.Join(t.TempDir(), ".env")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serve := func() {
+		go func() {
+			f, err := os.OpenFile(pipe, os.O_WRONLY, 0)
+			if err == nil {
+				f.WriteString("# from 1Password\nexport JR_CHAT_KEY=\"from-file\"\nJR_CHAT_MODEL=vendor/m\n")
+				f.Close()
+			}
+		}()
+	}
+	e.noCloud = true
+	e.extra = []string{"JR_ENV_FILE=" + pipe, "JR_CHAT_URL=" + e.url + "/v1"}
+
+	serve()
+	e.must("", "search", "Login")
+	if got := e.ai.chatReqs[len(e.ai.chatReqs)-1]; got["auth"] != "Bearer from-file" || got["model"] != "vendor/m" {
+		t.Errorf("want the key and model from the file, got %v", got)
+	}
+
+	serve()
+	e.extra = append(e.extra, "JR_CHAT_KEY=from-env")
+	e.must("", "search", "Login")
+	if got := e.ai.chatReqs[len(e.ai.chatReqs)-1]; got["auth"] != "Bearer from-env" {
+		t.Errorf("the environment should win over the file, got %v", got["auth"])
+	}
+}
+
+// A mounted pipe that nobody answers (1Password closed or its prompt not
+// approved) must not hang jr.
+func TestEnvFileWithoutWriter(t *testing.T) {
+	pipe := filepath.Join(t.TempDir(), ".env")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	loadEnvFile(pipe, 200*time.Millisecond)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("waited %v for a pipe with no writer", d)
 	}
 }
