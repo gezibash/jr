@@ -441,7 +441,7 @@ func TestTextQueryFindsImage(t *testing.T) {
 	if !strings.Contains(show, "header overlapping nav") {
 		t.Errorf("show is missing the caption:\n%s", show)
 	}
-	if !strings.Contains(show, "description: A screenshot showing fake bytes") {
+	if !strings.Contains(show, `description: "A screenshot showing fake bytes"`) {
 		t.Errorf("show is missing the generated description:\n%s", show)
 	}
 }
@@ -913,10 +913,10 @@ func TestFileLinksAndStats(t *testing.T) {
 	if got := ids(e.must("", "list", "--file", "other.go")); len(got) != 0 {
 		t.Errorf("--file other.go matched %v", got)
 	}
-	if show := e.must("", "show", cause); !strings.Contains(show, "linked from: "+fix) {
+	if show := e.must("", "show", cause); !strings.Contains(show, "linked_from: ["+fix) {
 		t.Errorf("show should list the entry linking here:\n%s", show)
 	}
-	if show := e.must("", "show", fix); !strings.Contains(show, "links: "+cause) {
+	if show := e.must("", "show", fix); !strings.Contains(show, "links: ["+cause) {
 		t.Errorf("a link given as a prefix should be stored as the full ID:\n%s", show)
 	}
 	if _, errOut, err := e.run("x", "add", "--link", "ZZZZ"); err == nil || !strings.Contains(errOut, "no entry") {
@@ -951,12 +951,12 @@ func TestOpenAndClose(t *testing.T) {
 	show := e.must("", "show", bug)
 	note := ""
 	for _, l := range strings.Split(show, "\n") {
-		if strings.HasPrefix(l, "- status: closed") {
+		if strings.HasPrefix(l, "closed_by: ") {
 			f := strings.Fields(l)
 			note = f[len(f)-1]
 		}
 	}
-	if note == "" || !strings.Contains(show, "linked from: "+note) {
+	if note == "" || !strings.Contains(show, "linked_from: ["+note) {
 		t.Fatalf("show should say closed by the note entry, which links back:\n%s", show)
 	}
 	if out := e.must("", "search", "--limit", "3", "Streamed the CSV"); !strings.HasPrefix(out, note) {
@@ -1337,5 +1337,62 @@ func TestConfigAndEnvNameTheSameEmbedder(t *testing.T) {
 	}
 	if out := e.must("", "search", "authentication problem"); !strings.HasPrefix(out, id) {
 		t.Errorf("not found by meaning after switching to env:\n%s", out)
+	}
+}
+
+// list says how long ago each entry was, so an agent needs no date arithmetic.
+// JRNL_NOW is 2026-11-19 15:30 +01:00; the expected ages are worked by hand.
+func TestListShowsAge(t *testing.T) {
+	e := newEnv(t)
+	cases := []struct{ at, want string }{
+		{"2026-11-19T15:29:30+01:00", "just now"},
+		{"2026-11-19T15:05:00+01:00", "25m ago"},
+		{"2026-11-18T14:30:00+01:00", "25h ago"},
+		{"2026-11-10T15:30:00+01:00", "9d ago"},
+		{"2026-10-01T15:30:00+02:00", "7w ago"},  // 49 days
+		{"2026-05-19T15:30:00+02:00", "6mo ago"}, // 184 days
+		{"2023-11-19T15:30:00+01:00", "3y ago"},
+	}
+	want := map[string]string{}
+	for _, c := range cases {
+		want[firstID(e.must("entry "+c.want, "add", "--at", c.at))] = c.want
+	}
+	for _, l := range strings.Split(strings.TrimSpace(e.must("", "list")), "\n") {
+		id := strings.Fields(l)[0]
+		if !strings.Contains(l, "  "+want[id]+"  ") {
+			t.Errorf("want %q in list line:\n%s", want[id], l)
+		}
+		if strings.Contains(l, "2026-") || strings.Contains(l, "2023-") {
+			t.Errorf("list line still shows a date:\n%s", l)
+		}
+	}
+}
+
+// show prints metadata as YAML front matter and the body as written, once.
+// read and open are the same command.
+func TestShowIsFrontMatterThenBody(t *testing.T) {
+	e := newEnv(t)
+	body := "Fix: login loop\n\nRoot cause: the # in the cookie name."
+	id := firstID(e.must(body, "add", "--kind", "bug", "--tag", "auth", "--at", "2026-11-19T12:30:00+01:00"))
+	out := e.must("", "show", id)
+	head, rest, ok := strings.Cut(strings.TrimPrefix(out, "---\n"), "\n---\n")
+	if !strings.HasPrefix(out, "---\n") || !ok {
+		t.Fatalf("want a front matter block first:\n%s", out)
+	}
+	if rest != "\n"+body+"\n" {
+		t.Errorf("the body after the front matter should be exactly the text added, got %q", rest)
+	}
+	for _, line := range []string{"id: " + id, `title: "Fix: login loop"`, "time: 2026-11-19 12:30 (3h ago)", "kind: bug", "tags: [auth]"} {
+		if !strings.Contains(head, line+"\n") {
+			t.Errorf("front matter is missing %q:\n%s", line, head)
+		}
+	}
+	if strings.Contains(out, "# Fix") {
+		t.Errorf("the title should not be repeated as a heading:\n%s", out)
+	}
+	for _, alias := range []string{"read", "open"} {
+		if got := e.must("", alias, id[:12]); got != out {
+			t.Errorf("%s should print what show prints, got:\n%s", alias, got)
+		}
 	}
 }

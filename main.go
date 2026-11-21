@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,12 +31,12 @@ const usage = `jrnl — per-project journal
       --open                   track it as open until closed (todo entries start open)
   jrnl close ID… [--note TEXT] mark entries closed; the note is saved as an entry linked to them
   jrnl reopen ID…              mark entries open again
-  jrnl show ID…                print entries as markdown (ID prefix is enough)
+  jrnl show ID…                print entries as markdown (ID prefix is enough); also read, open
   jrnl list [filters]          newest first; --oldest for oldest first
   jrnl search [filters] QUERY  keyword + semantic search over entries and attachment descriptions
       --newest | --oldest      the latest / the first matches, instead of the best
   jrnl search --like FILE      find attachments whose description is like FILE's
-  jrnl sessions [filters]      recent sessions: when, how many entries, last title
+  jrnl sessions [filters]      recent sessions: last active, how many entries, last title
   jrnl stats [filters]         counts by kind, tag and author
   jrnl summarize [filters]     summary of a period, citing entry IDs; saved and reused
       --refresh                write it again even if nothing changed
@@ -77,7 +78,7 @@ func main() {
 		os.Exit(2)
 	}
 	cmds := map[string]func([]string) error{
-		"add": cmdAdd, "show": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
+		"add": cmdAdd, "show": cmdShow, "read": cmdShow, "open": cmdShow, "list": cmdList, "ls": cmdList, "search": cmdSearch,
 		"reindex": cmdReindex, "backup": cmdBackup, "where": cmdWhere,
 		"sessions": cmdSessions, "stats": cmdStats, "close": cmdClose, "reopen": cmdReopen,
 		"summarize": cmdSummarize, "summarise": cmdSummarize, "doctor": cmdDoctor,
@@ -297,61 +298,84 @@ func cmdShow(args []string) error {
 			return err
 		}
 		if i > 0 {
-			fmt.Print("\n---\n\n")
+			fmt.Println()
 		}
 		printEntry(e)
 	}
 	return nil
 }
 
+// printEntry writes the entry as markdown: its metadata in a YAML front
+// matter block, then the body exactly as it was written.
 func printEntry(e Entry) {
-	fmt.Printf("# %s\n\n", e.Title)
-	fmt.Printf("- id: %s\n- time: %s\n- kind: %s · author: %s\n", e.ID, localTime(e.TS), e.Kind, e.Author)
-	if e.Branch != "" || e.Commit != "" {
-		fmt.Printf("- git: %s @ %s\n", e.Branch, e.Commit)
+	var b strings.Builder
+	field := func(k, v string) { fmt.Fprintf(&b, "%s: %s\n", k, v) }
+	list := func(k string, vs []string) {
+		if len(vs) > 0 {
+			field(k, "["+strings.Join(vs, ", ")+"]")
+		}
+	}
+	b.WriteString("---\n")
+	field("id", e.ID)
+	field("title", yamlString(e.Title))
+	field("time", fmt.Sprintf("%s (%s)", localTime(e.TS), ago(e.TS)))
+	field("kind", e.Kind)
+	field("author", yamlString(e.Author))
+	if e.Status != "" {
+		field("status", e.Status)
+	}
+	if e.Status == "closed" {
+		field("closed", fmt.Sprintf("%s (%s)", localTime(e.ClosedAt), ago(e.ClosedAt)))
+		if e.ClosedBy != "" {
+			field("closed_by", e.ClosedBy)
+		}
+	}
+	list("tags", e.Tags)
+	list("links", e.Links)
+	list("linked_from", e.LinkedFrom)
+	files := make([]string, len(e.Files))
+	for i, f := range e.Files {
+		files[i] = yamlString(f)
+	}
+	list("files", files)
+	if e.Branch != "" {
+		field("branch", yamlString(e.Branch))
+	}
+	if e.Commit != "" {
+		field("commit", e.Commit)
 	}
 	if e.Session != "" {
-		fmt.Printf("- session: %s\n", e.Session)
+		field("session", yamlString(e.Session))
 	}
-	if len(e.Tags) > 0 {
-		fmt.Printf("- tags: %s\n", strings.Join(e.Tags, ", "))
-	}
-	if len(e.Links) > 0 {
-		fmt.Printf("- links: %s\n", strings.Join(e.Links, ", "))
-	}
-	switch e.Status {
-	case "open":
-		fmt.Println("- status: open")
-	case "closed":
-		line := "- status: closed " + localTime(e.ClosedAt)
-		if e.ClosedBy != "" {
-			line += " by " + e.ClosedBy
-		}
-		fmt.Println(line)
-	}
-	if len(e.LinkedFrom) > 0 {
-		fmt.Printf("- linked from: %s\n", strings.Join(e.LinkedFrom, ", "))
-	}
-	if len(e.Files) > 0 {
-		fmt.Printf("- files: %s\n", strings.Join(e.Files, ", "))
-	}
-	for _, a := range e.Assets {
-		line := fmt.Sprintf("- attachment: %s (%s, %s)", a.Path, a.Name, a.Mime)
-		if a.Caption != "" {
-			line += " — " + a.Caption
-		}
-		fmt.Println(line)
-		if a.Description != "" {
-			fmt.Printf("  - description: %s\n", oneLine(a.Description))
+	if len(e.Assets) > 0 {
+		b.WriteString("attachments:\n")
+		for _, a := range e.Assets {
+			fmt.Fprintf(&b, "  - path: %s\n    name: %s\n    type: %s\n", yamlString(a.Path), yamlString(a.Name), a.Mime)
+			if a.Caption != "" {
+				fmt.Fprintf(&b, "    caption: %s\n", yamlString(a.Caption))
+			}
+			if a.Description != "" {
+				fmt.Fprintf(&b, "    description: %s\n", yamlString(oneLine(a.Description)))
+			}
 		}
 	}
-	if e.Body != "" {
-		fmt.Printf("\n%s\n", e.Body)
+	b.WriteString("---\n")
+	if body := strings.TrimSpace(e.Body); body != "" {
+		b.WriteString("\n" + body + "\n")
 	}
+	fmt.Print(b.String())
+}
+
+// yamlString quotes free text for the front matter. A JSON string is valid
+// YAML, and quoting every value keeps titles like "true", "null" or "2026"
+// from reading as a bool, null or number.
+func yamlString(s string) string {
+	q, _ := json.Marshal(s)
+	return string(q)
 }
 
 func summaryLine(e Entry) string {
-	line := fmt.Sprintf("%s  %s  %-9s %s", e.ID, localTime(e.TS), e.Kind, e.Title)
+	line := fmt.Sprintf("%s  %-8s  %-9s %s", e.ID, ago(e.TS), e.Kind, e.Title)
 	if e.Status != "" {
 		line += "  [" + e.Status + "]"
 	}
@@ -410,7 +434,7 @@ func cmdSessions(args []string) error {
 		if si.ID == me {
 			mark = "  (this session)"
 		}
-		fmt.Printf("%s  %s → %s  %3d entries  last: %s%s\n", si.ID, localTime(si.First), localTime(si.Last)[11:], si.Entries, si.LastTitle, mark)
+		fmt.Printf("%s  %-8s  %3d entries  last: %s%s\n", si.ID, ago(si.Last), si.Entries, si.LastTitle, mark)
 	}
 	return nil
 }

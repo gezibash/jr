@@ -142,3 +142,38 @@ func parseWhen(s string, ref time.Time) (span, error) {
 	}
 	return span{}, fmt.Errorf("can't read %q: %s", s, whenHelp)
 }
+
+// ago says how long before now ts was, in the largest whole unit: "just
+// now", "5m ago", "3h ago", "4d ago", "3w ago", "5mo ago", "2y ago". Agents
+// read it without doing date arithmetic against today.
+func ago(ts string) string {
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ts
+	}
+	d := now().Sub(t)
+	suffix := " ago"
+	prefix := ""
+	if d < 0 {
+		d, prefix, suffix = -d, "in ", ""
+	}
+	days := int(d.Hours() / 24)
+	var n string
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		n = fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 48*time.Hour:
+		n = fmt.Sprintf("%dh", int(d.Hours()))
+	case days < 14:
+		n = fmt.Sprintf("%dd", days)
+	case days < 60:
+		n = fmt.Sprintf("%dw", days/7)
+	case days < 730:
+		n = fmt.Sprintf("%dmo", days/30)
+	default:
+		n = fmt.Sprintf("%dy", days/365)
+	}
+	return prefix + n + suffix
+}
