@@ -19,7 +19,7 @@ this error before", "what's still open", "summarise last week".
 mise use -g github:gezibash/jrnl
 ```
 
-Or download a binary from the releases page, or `go install github.com/gezibash/jrnl@latest`.
+Or download a binary from the releases page, or `go install github.com/gezibash/jrnl@main`.
 
 ## Setup
 
