@@ -1,4 +1,4 @@
-# jr
+# jrnl
 
 A journal per project, for coding agents and the people working with them.
 Agents write down decisions, bug root causes, findings and screenshots as
@@ -16,10 +16,10 @@ this error before", "what's still open", "summarise last week".
 ## Install
 
 ```bash
-mise use -g github:gezibash/jr
+mise use -g github:gezibash/jrnl
 ```
 
-Or download a binary from the releases page, or `go install github.com/gezibash/jr@latest`.
+Or download a binary from the releases page, or `go install github.com/gezibash/jrnl@latest`.
 
 ## Setup
 
@@ -36,7 +36,7 @@ Each optional part adds more. Turn them on in any order, whenever you like:
 | `search --like` by look and sound | Media embeddings from Cloudflare Workers AI. Without them, `--like` compares descriptions, which needs the chat model |
 | Video and audio attachments | `ffmpeg`; audio transcription uses `parakeet-mlx` through `uvx` (Apple silicon) |
 
-Set them up in `~/.config/jr/config.toml` (or `JR_CONFIG`). Providers say
+Set them up in `~/.config/jrnl/config.toml` (or `JRNL_CONFIG`). Providers say
 where a service is; each role picks a provider and a model:
 
 ```toml
@@ -70,22 +70,22 @@ model    = "@cf/google/embeddinggemma-2"
 
 OpenAI, Vercel AI Gateway, OpenRouter, Ollama, LM Studio, vLLM and others
 work as `openai` providers. The file holds no keys, only the names of the
-variables that do, so it can go in a public dotfiles repository. jr refuses
+variables that do, so it can go in a public dotfiles repository. jrnl refuses
 settings it doesn't know, so a typo can't quietly turn a part off.
 
-Variables win over the file: `JR_EMBED_*`, `JR_CHAT_*` and `JR_RERANK_*`
-(`_URL`, `_KEY`, `_MODEL`), and `JR_CHAT_EXTRA`. A `_URL` replaces the whole
+Variables win over the file: `JRNL_EMBED_*`, `JRNL_CHAT_*` and `JRNL_RERANK_*`
+(`_URL`, `_KEY`, `_MODEL`), and `JRNL_CHAT_EXTRA`. A `_URL` replaces the whole
 role with an OpenAI-compatible API, so the file's key is never sent to it; a
 `_MODEL` or `_KEY` alone replaces just that.
 
-Keys that are not in the environment are read from `~/.config/jr/.env` (or
-`JR_ENV_FILE`), one `KEY=value` per line. That file can be a
+Keys that are not in the environment are read from `~/.config/jrnl/.env` (or
+`JRNL_ENV_FILE`), one `KEY=value` per line. That file can be a
 [1Password Environment](https://www.1password.dev/environments/local-env-file)
 mounted as a local `.env` file, so keys never sit on disk.
 
-`jr doctor` shows which parts are on, which models they use, where each was
+`jrnl doctor` shows which parts are on, which models they use, where each was
 set, and how to turn on the rest. After turning one on, or switching
-embedding model, `jr reindex` indexes everything saved before. Vectors from
+embedding model, `jrnl reindex` indexes everything saved before. Vectors from
 different embedding models are never compared.
 
 Measured on the same 20,000 entries and 30 reworded questions:
@@ -121,12 +121,12 @@ hard case. Search by meaning is what closes that gap.
 ## Use
 
 ```bash
-jr add --kind bug --tag auth "Users logged out after token refresh
+jrnl add --kind bug --tag auth "Users logged out after token refresh
 
 Root cause: the refresh handler raced with the session writer."
-jr search "users logged out"
-jr list --on yesterday
-jr list --status open --on "last week"
-jr summarize --on "last week"
-jr help
+jrnl search "users logged out"
+jrnl list --on yesterday
+jrnl list --status open --on "last week"
+jrnl summarize --on "last week"
+jrnl help
 ```

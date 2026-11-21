@@ -89,7 +89,7 @@ func format(model string, in Input) string {
 	return t
 }
 
-// AI reaches the models jr uses, all optional:
+// AI reaches the models jrnl uses, all optional:
 //   - text embeddings: any OpenAI-compatible /embeddings API; by default
 //     Ollama on this machine.
 //   - chat, for captions, reranking and summaries: any OpenAI-compatible
@@ -98,7 +98,7 @@ func format(model string, in Input) string {
 //   - media vectors (search --like by look): Cloudflare Workers AI's own API.
 type AI struct {
 	embedURL, embedKey, embedModel, embedID string
-	embedSet                                bool // set by config or JR_EMBED_URL, not the Ollama default
+	embedSet                                bool // set by config or JRNL_EMBED_URL, not the Ollama default
 
 	chatURL, chatKey, chatModel string
 
@@ -109,7 +109,7 @@ type AI struct {
 	mediaID  string
 	mediaErr error
 
-	from map[string]string // role: where it was set, for jr doctor
+	from map[string]string // role: where it was set, for jrnl doctor
 
 	// A dedicated reranker with a Cohere-style /rerank API, optional.
 	rerankURL, rerankKey, rerankModel string
@@ -134,13 +134,13 @@ func (e *AI) Interactive(deadline time.Duration) *AI {
 // NewAI reads its settings from the environment:
 //
 //	(see config.go for config.toml; these variables override it)
-//	JR_EMBED_URL, JR_EMBED_KEY, JR_EMBED_MODEL  text embeddings
+//	JRNL_EMBED_URL, JRNL_EMBED_KEY, JRNL_EMBED_MODEL  text embeddings
 //	    (default: Ollama at OLLAMA_HOST or localhost:11434, embeddinggemma-2)
-//	JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL     chat
-//	JR_CHAT_EXTRA                               JSON fields added to each chat request
-//	JR_RERANK_URL, JR_RERANK_KEY, JR_RERANK_MODEL  a reranker with a
+//	JRNL_CHAT_URL, JRNL_CHAT_KEY, JRNL_CHAT_MODEL     chat
+//	JRNL_CHAT_EXTRA                                   JSON fields added to each chat request
+//	JRNL_RERANK_URL, JRNL_RERANK_KEY, JRNL_RERANK_MODEL  a reranker with a
 //	    Cohere-style /rerank API (Cohere, Voyage, Jina, Vercel AI Gateway)
-//	JR_ENV_FILE                                 more of these settings (see envFile)
+//	JRNL_ENV_FILE                                     more of these settings (see envFile)
 
 // ollamaURL is the OpenAI-compatible API of Ollama at OLLAMA_HOST.
 func ollamaURL() string {
@@ -154,21 +154,21 @@ func ollamaURL() string {
 	return strings.TrimSuffix(host, "/") + "/v1"
 }
 
-// envFile is where jr looks for API keys that are not in the environment:
-// JR_ENV_FILE, or ~/.config/jr/.env. It can be a 1Password Environment
+// envFile is where jrnl looks for API keys that are not in the environment:
+// JRNL_ENV_FILE, or ~/.config/jrnl/.env. It can be a 1Password Environment
 // mounted as a local .env file, which is a named pipe.
 func envFile() string {
-	if p := os.Getenv("JR_ENV_FILE"); p != "" {
+	if p := os.Getenv("JRNL_ENV_FILE"); p != "" {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "jr", ".env")
+	return filepath.Join(home, ".config", "jrnl", ".env")
 }
 
 // loadEnvFile sets each KEY=VALUE from the file that the environment does
 // not already set. A missing file is fine. A named pipe whose writer does not
 // answer within wait (1Password closed, or its prompt not yet approved) is
-// skipped with a warning, so jr still saves entries, without the keys.
+// skipped with a warning, so jrnl still saves entries, without the keys.
 func loadEnvFile(path string, wait time.Duration) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -181,7 +181,7 @@ func loadEnvFile(path string, wait time.Duration) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		// 1Password serves one reader at a time: of 5 jr processes reading
+		// 1Password serves one reader at a time: of 5 jrnl processes reading
 		// at once, 2 got an empty file. An empty pipe is read again.
 		var data []byte
 		var err error
@@ -200,7 +200,7 @@ func loadEnvFile(path string, wait time.Duration) {
 		r.err = fmt.Errorf("no answer in %v; is 1Password unlocked, and was its prompt approved?", wait)
 	}
 	if r.err != nil {
-		fmt.Fprintf(os.Stderr, "jr: skipped %s: %v\n", path, r.err)
+		fmt.Fprintf(os.Stderr, "jrnl: skipped %s: %v\n", path, r.err)
 		return
 	}
 	for _, line := range strings.Split(string(r.data), "\n") {
@@ -250,10 +250,10 @@ func NewAI() (*AI, error) {
 	if e.chatURL == "" {
 		e.chatErr = errNoChat
 	}
-	if x := os.Getenv("JR_CHAT_EXTRA"); x != "" {
+	if x := os.Getenv("JRNL_CHAT_EXTRA"); x != "" {
 		e.chatExtra = nil
 		if err := json.Unmarshal([]byte(x), &e.chatExtra); err != nil {
-			return nil, fmt.Errorf("JR_CHAT_EXTRA must be a JSON object: %w", err)
+			return nil, fmt.Errorf("JRNL_CHAT_EXTRA must be a JSON object: %w", err)
 		}
 	}
 
@@ -558,7 +558,7 @@ func (e *AI) chat(content any, maxTokens int) (string, error) {
 	}
 	c := res.Choices[0]
 	if c.FinishReason == "length" {
-		fmt.Fprintf(os.Stderr, "jr: the reply hit its %d-token limit and is cut off\n", maxTokens)
+		fmt.Fprintf(os.Stderr, "jrnl: the reply hit its %d-token limit and is cut off\n", maxTokens)
 	}
 	return strings.TrimSpace(c.Message.Content), nil
 }
@@ -641,24 +641,24 @@ func (e *AI) rerankAPI(query string, items []string, k int) ([]int, error) {
 	return order, nil
 }
 
-// notSetUp marks a part of jr that this machine has not been set up for:
+// notSetUp marks a part of jrnl that this machine has not been set up for:
 // no chat API, no media embedder, no ffmpeg, no parakeet. The work
-// waits, quietly, for `jr reindex` after setup; `jr doctor` says how to turn
+// waits, quietly, for `jrnl reindex` after setup; `jrnl doctor` says how to turn
 // each part on.
 type notSetUp struct{ error }
 
 var (
-	errNoChat       = notSetUp{errors.New("no chat model is set up ([chat] in config.toml, or JR_CHAT_URL and JR_CHAT_MODEL)")}
+	errNoChat       = notSetUp{errors.New("no chat model is set up ([chat] in config.toml, or JRNL_CHAT_URL and JRNL_CHAT_MODEL)")}
 	errNoMediaEmbed = notSetUp{errors.New("no media embedder is set up ([media_embed] in config.toml)")}
 )
 
 // embedDown means nothing answered at the embeddings address. With no
-// JR_EMBED_URL, no ollama installed and no text embedding in the journal yet,
-// that is a machine without Ollama, and jr stays quiet; otherwise it was set
+// JRNL_EMBED_URL, no ollama installed and no text embedding in the journal yet,
+// that is a machine without Ollama, and jrnl stays quiet; otherwise it was set
 // up and is now broken.
 type embedDown struct {
 	addr string
-	set  bool // JR_EMBED_URL was given
+	set  bool // JRNL_EMBED_URL was given
 	err  error
 }
 

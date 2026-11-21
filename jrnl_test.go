@@ -1,6 +1,6 @@
 package main
 
-// Tests drive the real jr binary against a fake Workers AI server, the same
+// Tests drive the real jrnl binary against a fake Workers AI server, the same
 // boundary Claude uses.
 
 import (
@@ -27,11 +27,11 @@ import (
 var bin string
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "jr-test-bin")
+	dir, err := os.MkdirTemp("", "jrnl-test-bin")
 	if err != nil {
 		panic(err)
 	}
-	bin = filepath.Join(dir, "jr")
+	bin = filepath.Join(dir, "jrnl")
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		panic(string(out))
 	}
@@ -40,7 +40,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// fakeAI stands in for the two Workers AI models jr calls.
+// fakeAI stands in for the two Workers AI models jrnl calls.
 //
 // Embeddings are hand-built on concept axes, so a text and an image can be
 // "about" the same thing without sharing a word:
@@ -177,7 +177,7 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal(body, &req)
 		if prompt, ok := req.Messages[0].Content.(string); ok && strings.HasPrefix(prompt, "Write a short overview") {
 			// Overview of a long period: one bullet per day it was given,
-			// plus a day that doesn't exist, which jr must drop.
+			// plus a day that doesn't exist, which jrnl must drop.
 			f.summaryCalls.Add(1)
 			var lines []string
 			for _, m := range regexp.MustCompile(`(?m)^D(\d+) \(`).FindAllStringSubmatch(prompt, -1) {
@@ -193,7 +193,7 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.summaryCalls.Add(1)
 			// One bullet per entry number in the prompt (or per citation in
 			// part summaries being combined), plus a number that matches no
-			// entry, which jr must drop.
+			// entry, which jrnl must drop.
 			var lines []string
 			for _, m := range regexp.MustCompile(`(?m)^\[(\d+)\]|- item \[(\d+)\]`).FindAllStringSubmatch(prompt, -1) {
 				lines = append(lines, "- item ["+m[1]+m[2]+"]")
@@ -245,7 +245,7 @@ func (f *fakeAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Text sent through "messages" embeds differently from text sent through
-	// "input" (cosine 0.74-0.81 on the real API), so jr must never do it.
+	// "input" (cosine 0.74-0.81 on the real API), so jrnl must never do it.
 	for _, m := range req.Messages {
 		if _, isText := m[0]["content"].(string); isText {
 			http.Error(w, `{"success":false,"errors":[{"message":"text sent on the messages path"}]}`, 400)
@@ -285,8 +285,8 @@ type env struct {
 	ollama string   // OLLAMA_HOST; the fake server unless a test changes it
 	noChat bool     // no chat model set up, like a fresh install
 	config string   // config.toml; by default Cloudflare media vectors from the fake server
-	extra  []string // more environment, such as JR_CHAT_URL=...
-	path   string   // PATH for jr, when a test hides tools such as ffmpeg
+	extra  []string // more environment, such as JRNL_CHAT_URL=...
+	path   string   // PATH for jrnl, when a test hides tools such as ffmpeg
 }
 
 func newEnv(t *testing.T) *env {
@@ -297,7 +297,7 @@ func newEnv(t *testing.T) *env {
 [providers.cf]
 type = "cloudflare"
 url  = "` + srv.URL + `"
-key  = "env:JR_TEST_CF_KEY"
+key  = "env:JRNL_TEST_CF_KEY"
 
 [media_embed]
 provider = "cf"
@@ -307,22 +307,22 @@ model    = "@cf/google/embeddinggemma-2"
 
 func (e *env) run(stdin string, args ...string) (string, string, error) {
 	cmd := exec.Command(bin, append(args, "--project", "test")...)
-	cmd.Env = append(os.Environ(), "JR_HOME="+e.home, "OLLAMA_HOST="+e.ollama,
+	cmd.Env = append(os.Environ(), "JRNL_HOME="+e.home, "OLLAMA_HOST="+e.ollama,
 		// A fixed clock and zone: Thursday 2026-11-19, 15:30 in Berlin (UTC+1).
-		"TZ=Europe/Berlin", "JR_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
+		"TZ=Europe/Berlin", "JRNL_NOW=2026-11-19T15:30:00+01:00", "CLAUDECODE=", "CLAUDE_CODE_SESSION_ID=sess-1")
 	// This machine's own settings must not leak in.
-	cmd.Env = append(cmd.Env, "JR_CHAT_URL="+e.url+"/v1", "JR_CHAT_KEY=chat-test", "JR_CHAT_MODEL=test/vision",
-		"JR_CHAT_EXTRA=", "JR_EMBED_URL=", "JR_EMBED_KEY=", "JR_EMBED_MODEL=",
-		"JR_RERANK_URL=", "JR_RERANK_KEY=", "JR_RERANK_MODEL=", "JR_ENV_FILE="+filepath.Join(e.home, "no-env-file"),
-		"JR_TEST_CF_KEY=cf-test")
+	cmd.Env = append(cmd.Env, "JRNL_CHAT_URL="+e.url+"/v1", "JRNL_CHAT_KEY=chat-test", "JRNL_CHAT_MODEL=test/vision",
+		"JRNL_CHAT_EXTRA=", "JRNL_EMBED_URL=", "JRNL_EMBED_KEY=", "JRNL_EMBED_MODEL=",
+		"JRNL_RERANK_URL=", "JRNL_RERANK_KEY=", "JRNL_RERANK_MODEL=", "JRNL_ENV_FILE="+filepath.Join(e.home, "no-env-file"),
+		"JRNL_TEST_CF_KEY=cf-test")
 	conf := filepath.Join(e.home, "config.toml")
 	os.Remove(conf)
 	if e.config != "" {
 		os.WriteFile(conf, []byte(e.config), 0o644)
 	}
-	cmd.Env = append(cmd.Env, "JR_CONFIG="+conf)
+	cmd.Env = append(cmd.Env, "JRNL_CONFIG="+conf)
 	if e.noChat {
-		cmd.Env = append(cmd.Env, "JR_CHAT_URL=", "JR_CHAT_KEY=", "JR_CHAT_MODEL=")
+		cmd.Env = append(cmd.Env, "JRNL_CHAT_URL=", "JRNL_CHAT_KEY=", "JRNL_CHAT_MODEL=")
 	}
 	cmd.Env = append(cmd.Env, e.extra...)
 	if e.path != "" {
@@ -341,7 +341,7 @@ func (e *env) must(stdin string, args ...string) string {
 	e.t.Helper()
 	out, errOut, err := e.run(stdin, args...)
 	if err != nil {
-		e.t.Fatalf("jr %v: %v\n%s", args, err, errOut)
+		e.t.Fatalf("jrnl %v: %v\n%s", args, err, errOut)
 	}
 	return out
 }
@@ -668,7 +668,7 @@ func TestSearchDoesNotWaitOnSlowReranker(t *testing.T) {
 // With Ollama down, entries are still saved and search still answers by
 // keyword; once Ollama is back, reindex makes them findable by meaning.
 // There is no silent fallback to another embedder. On a journal Ollama has
-// never embedded, that is a machine without Ollama and jr stays quiet; once
+// never embedded, that is a machine without Ollama and jrnl stays quiet; once
 // Ollama has been used, losing it is reported.
 func TestOllamaDown(t *testing.T) {
 	e := newEnv(t)
@@ -706,7 +706,7 @@ func TestOllamaDown(t *testing.T) {
 	}
 }
 
-// A fresh install has no Ollama and no chat model. jr must work without a
+// A fresh install has no Ollama and no chat model. jrnl must work without a
 // word of setup noise, say how to get more only when it matters, and index
 // everything saved meanwhile once the parts are turned on.
 func TestFreshInstall(t *testing.T) {
@@ -728,7 +728,7 @@ func TestFreshInstall(t *testing.T) {
 	}
 	id := firstID(out)
 	out, errOut, err = e.run("Settings page layout.", "add", "--attach", img)
-	if err != nil || strings.Count(errOut, "\n") != 1 || !strings.Contains(errOut, "jr doctor") {
+	if err != nil || strings.Count(errOut, "\n") != 1 || !strings.Contains(errOut, "jrnl doctor") {
 		t.Fatalf("attaching should say once that captions need setup: %v, stderr %q", err, errOut)
 	}
 	imgID := firstID(out)
@@ -736,16 +736,16 @@ func TestFreshInstall(t *testing.T) {
 	if out, errOut, _ := e.run("", "search", "Login"); !strings.HasPrefix(out, id) || errOut != "" {
 		t.Errorf("keyword search should work quietly; stderr %q:\n%s", errOut, out)
 	}
-	if out, errOut, _ := e.run("", "search", "authentication problem"); out != "" || !strings.Contains(errOut, "jr doctor") {
-		t.Errorf("a search with no keyword match should point to jr doctor; stderr %q:\n%s", errOut, out)
+	if out, errOut, _ := e.run("", "search", "authentication problem"); out != "" || !strings.Contains(errOut, "jrnl doctor") {
+		t.Errorf("a search with no keyword match should point to jrnl doctor; stderr %q:\n%s", errOut, out)
 	}
 	_, errOut, err = e.run("", "summarize", "--on", "today")
-	if err == nil || !strings.Contains(errOut, "jr list") || !strings.Contains(errOut, "jr doctor") {
-		t.Errorf("summarize should explain and point to jr list: %v, stderr %q", err, errOut)
+	if err == nil || !strings.Contains(errOut, "jrnl list") || !strings.Contains(errOut, "jrnl doctor") {
+		t.Errorf("summarize should explain and point to jrnl list: %v, stderr %q", err, errOut)
 	}
 	doc := e.must("", "doctor")
 	// Waiting: the text of both entries, and the image's description.
-	for _, want := range []string{"2 entries", "3 item(s) waiting", "embedding  off", "chat       off", "JR_CHAT_URL"} {
+	for _, want := range []string{"2 entries", "3 item(s) waiting", "embedding  off", "chat       off", "JRNL_CHAT_URL"} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("doctor is missing %q:\n%s", want, doc)
 		}
@@ -1096,7 +1096,7 @@ func TestSummarizeLongPeriodByDay(t *testing.T) {
 	}
 }
 
-// Any OpenAI-compatible chat API works: jr sends the configured model, key
+// Any OpenAI-compatible chat API works: jrnl sends the configured model, key
 // and extra fields.
 func TestAnyChatProvider(t *testing.T) {
 	e := newEnv(t)
@@ -1106,8 +1106,8 @@ func TestAnyChatProvider(t *testing.T) {
 	e.must("rerank-me: Login is slow on Mondays.", "add")
 
 	e.noChat = true
-	e.extra = []string{"JR_CHAT_URL=" + e.url + "/v1/", "JR_CHAT_KEY=k-test", "JR_CHAT_MODEL=vendor/some-model",
-		`JR_CHAT_EXTRA={"reasoning_effort":"low"}`}
+	e.extra = []string{"JRNL_CHAT_URL=" + e.url + "/v1/", "JRNL_CHAT_KEY=k-test", "JRNL_CHAT_MODEL=vendor/some-model",
+		`JRNL_CHAT_EXTRA={"reasoning_effort":"low"}`}
 	out, errOut, err := e.run("", "search", "Login")
 	if err != nil || !strings.Contains(strings.SplitN(out, "\n", 2)[0], "rerank-me") {
 		t.Fatalf("search should be reranked by the configured model: %v %q\n%s", err, errOut, out)
@@ -1123,8 +1123,8 @@ func TestAnyChatProvider(t *testing.T) {
 		t.Errorf("attachment not captioned through the configured model:\n%s", out)
 	}
 
-	e.extra = []string{"JR_CHAT_URL=" + e.url + "/v1"}
-	if _, errOut, err := e.run("", "search", "Login"); err == nil || !strings.Contains(errOut, "JR_CHAT_MODEL") {
+	e.extra = []string{"JRNL_CHAT_URL=" + e.url + "/v1"}
+	if _, errOut, err := e.run("", "search", "Login"); err == nil || !strings.Contains(errOut, "JRNL_CHAT_MODEL") {
 		t.Errorf("a chat URL without a model should be refused: %v %q", err, errOut)
 	}
 }
@@ -1134,7 +1134,7 @@ func TestAnyChatProvider(t *testing.T) {
 func TestSwitchEmbeddingModel(t *testing.T) {
 	e := newEnv(t)
 	id := firstID(e.must("Login form rejects valid credentials.", "add"))
-	e.extra = []string{"JR_EMBED_URL=" + e.url + "/v1", "JR_EMBED_KEY=k", "JR_EMBED_MODEL=other-embedder"}
+	e.extra = []string{"JRNL_EMBED_URL=" + e.url + "/v1", "JRNL_EMBED_KEY=k", "JRNL_EMBED_MODEL=other-embedder"}
 	if out := e.must("", "search", "authentication problem"); strings.Contains(out, id) {
 		t.Fatalf("matched a vector from the old model:\n%s", out)
 	}
@@ -1187,14 +1187,14 @@ func TestUpgradeKeepsOldVectors(t *testing.T) {
 
 // Each embedding model gets text in the format its model card asks for:
 // Qwen3 wants an instruction on the query and the document plain; models
-// jr knows nothing about get plain text.
+// jrnl knows nothing about get plain text.
 func TestTextFormatFollowsTheModel(t *testing.T) {
 	for model, want := range map[string][2]string{
 		"qwen3-embedding:0.6b":   {"Instruct: ", "Login\n\nLogin form rejects valid credentials."},
 		"text-embedding-3-small": {"authentication problem", "Login\n\nLogin form rejects valid credentials."},
 	} {
 		e := newEnv(t)
-		e.extra = []string{"JR_EMBED_MODEL=" + model}
+		e.extra = []string{"JRNL_EMBED_MODEL=" + model}
 		e.must("Login form rejects valid credentials.", "add", "--title", "Login")
 		e.must("", "search", "authentication problem")
 		got := strings.Join(e.ai.texts, "\n---\n")
@@ -1210,7 +1210,7 @@ func TestRerankAPI(t *testing.T) {
 	for _, model := range []string{"cohere/rerank-v5-fast", "voyage/rerank-3-lite"} {
 		e := newEnv(t)
 		e.noChat = true // no chat model at all
-		e.extra = []string{"JR_RERANK_URL=" + e.url + "/v1", "JR_RERANK_KEY=k", "JR_RERANK_MODEL=" + model}
+		e.extra = []string{"JRNL_RERANK_URL=" + e.url + "/v1", "JRNL_RERANK_KEY=k", "JRNL_RERANK_MODEL=" + model}
 		e.must("Login form rejects valid credentials.", "add")
 		e.must("rerank-me: Login is slow on Mondays.", "add")
 		out, errOut, err := e.run("", "search", "Login")
@@ -1240,13 +1240,13 @@ func TestKeysFromEnvFile(t *testing.T) {
 			}
 			f, err := os.OpenFile(pipe, os.O_WRONLY, 0)
 			if err == nil {
-				f.WriteString("# from 1Password\nexport JR_CHAT_KEY=\"from-file\"\nJR_CHAT_MODEL=vendor/m\n")
+				f.WriteString("# from 1Password\nexport JRNL_CHAT_KEY=\"from-file\"\nJRNL_CHAT_MODEL=vendor/m\n")
 				f.Close()
 			}
 		}()
 	}
 	e.noChat = true
-	e.extra = []string{"JR_ENV_FILE=" + pipe, "JR_CHAT_URL=" + e.url + "/v1"}
+	e.extra = []string{"JRNL_ENV_FILE=" + pipe, "JRNL_CHAT_URL=" + e.url + "/v1"}
 
 	serve()
 	e.must("", "search", "Login")
@@ -1255,7 +1255,7 @@ func TestKeysFromEnvFile(t *testing.T) {
 	}
 
 	serve()
-	e.extra = append(e.extra, "JR_CHAT_KEY=from-env")
+	e.extra = append(e.extra, "JRNL_CHAT_KEY=from-env")
 	e.must("", "search", "Login")
 	if got := e.ai.chatReqs[len(e.ai.chatReqs)-1]; got["auth"] != "Bearer from-env" {
 		t.Errorf("the environment should win over the file, got %v", got["auth"])
@@ -1263,7 +1263,7 @@ func TestKeysFromEnvFile(t *testing.T) {
 }
 
 // A mounted pipe that nobody answers (1Password closed or its prompt not
-// approved) must not hang jr.
+// approved) must not hang jrnl.
 func TestEnvFileWithoutWriter(t *testing.T) {
 	pipe := filepath.Join(t.TempDir(), ".env")
 	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
@@ -1276,7 +1276,7 @@ func TestEnvFileWithoutWriter(t *testing.T) {
 	}
 }
 
-// config.toml picks each role's provider and model. JR_* variables win: a
+// config.toml picks each role's provider and model. JRNL_* variables win: a
 // lone model or key replaces that field, and a URL replaces the whole role,
 // so the file's key never goes to another URL.
 func TestConfigFile(t *testing.T) {
@@ -1304,11 +1304,11 @@ extra    = { reasoning_effort = "low", kwargs = { thinking = false } }
 		got["kwargs"].(map[string]any)["thinking"] != false {
 		t.Errorf("want the config's model, key and extra field, got %v", got)
 	}
-	if got := lastChat("JR_CHAT_MODEL=env/model"); got["model"] != "env/model" || got["auth"] != "Bearer k-conf" {
-		t.Errorf("JR_CHAT_MODEL alone should replace only the model, got %v", got)
+	if got := lastChat("JRNL_CHAT_MODEL=env/model"); got["model"] != "env/model" || got["auth"] != "Bearer k-conf" {
+		t.Errorf("JRNL_CHAT_MODEL alone should replace only the model, got %v", got)
 	}
-	if got := lastChat("JR_CHAT_URL="+e.url+"/v1", "JR_CHAT_MODEL=env/model"); got["auth"] == "Bearer k-conf" {
-		t.Errorf("the config's key went to the URL set by JR_CHAT_URL: %v", got)
+	if got := lastChat("JRNL_CHAT_URL="+e.url+"/v1", "JRNL_CHAT_MODEL=env/model"); got["auth"] == "Bearer k-conf" {
+		t.Errorf("the config's key went to the URL set by JRNL_CHAT_URL: %v", got)
 	}
 
 	e.extra = nil
@@ -1325,13 +1325,13 @@ extra    = { reasoning_effort = "low", kwargs = { thinking = false } }
 }
 
 // The same embedding model at the same URL is the same embedder, whether
-// config.toml or JR_EMBED_* names it: switching must not re-embed anything.
+// config.toml or JRNL_EMBED_* names it: switching must not re-embed anything.
 func TestConfigAndEnvNameTheSameEmbedder(t *testing.T) {
 	e := newEnv(t)
 	e.config = "[providers.o]\nurl = \"" + e.url + "/v1\"\n[embed]\nprovider = \"o\"\nmodel = \"emb-x\"\n"
 	id := firstID(e.must("Login form rejects valid credentials.", "add"))
 	e.config = ""
-	e.extra = []string{"JR_EMBED_URL=" + e.url + "/v1", "JR_EMBED_MODEL=emb-x"}
+	e.extra = []string{"JRNL_EMBED_URL=" + e.url + "/v1", "JRNL_EMBED_MODEL=emb-x"}
 	if doc := e.must("", "doctor"); strings.Contains(doc, "waiting") || !strings.Contains(doc, "emb-x") {
 		t.Errorf("switching from config to env should not need a reindex:\n%s", doc)
 	}

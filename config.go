@@ -23,7 +23,7 @@ import (
 //	provider = "vercel"
 //	model    = "google/gemma-4-26b-a4b-it"
 //
-// The file holds no secrets: a key names the variable that has it. JR_*
+// The file holds no secrets: a key names the variable that has it. JRNL_*
 // variables win over the file (see resolve).
 type config struct {
 	Providers  map[string]providerConf `toml:"providers"`
@@ -55,13 +55,13 @@ var roleTypes = map[string][]string{
 	"chat":        {"openai", "cloudflare"},
 }
 
-// configFile is JR_CONFIG, or ~/.config/jr/config.toml.
+// configFile is JRNL_CONFIG, or ~/.config/jrnl/config.toml.
 func configFile() string {
-	if p := os.Getenv("JR_CONFIG"); p != "" {
+	if p := os.Getenv("JRNL_CONFIG"); p != "" {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "jr", "config.toml")
+	return filepath.Join(home, ".config", "jrnl", "config.toml")
 }
 
 // loadConfig reads the file; a missing file is an empty config. Anything
@@ -93,26 +93,26 @@ type endpoint struct {
 	key   string
 	model string
 	extra map[string]any
-	from  string // where it was set, for jr doctor
+	from  string // where it was set, for jrnl doctor
 }
 
-// resolve gives role r its endpoint. JR_<env>_URL, when set, defines the
+// resolve gives role r its endpoint. JRNL_<env>_URL, when set, defines the
 // whole role from the environment (an OpenAI-compatible API), so a key from
-// the file is never sent to another URL. JR_<env>_MODEL and JR_<env>_KEY
+// the file is never sent to another URL. JRNL_<env>_MODEL and JRNL_<env>_KEY
 // alone replace just that field. env "" means the role has no variables.
 func (c config) resolve(role string, r roleConf, env string) (endpoint, error) {
 	get := func(field string) string {
 		if env == "" {
 			return ""
 		}
-		return os.Getenv("JR_" + env + "_" + field)
+		return os.Getenv("JRNL_" + env + "_" + field)
 	}
 	var e endpoint
 	if u := get("URL"); u != "" {
 		e = endpoint{kind: "openai", url: strings.TrimSuffix(u, "/"), key: get("KEY"), model: get("MODEL"),
-			from: "JR_" + env + "_URL"}
+			from: "JRNL_" + env + "_URL"}
 		if e.model == "" {
-			return e, fmt.Errorf("JR_%s_URL is set, so set JR_%s_MODEL too", env, env)
+			return e, fmt.Errorf("JRNL_%s_URL is set, so set JRNL_%s_MODEL too", env, env)
 		}
 		return e, nil
 	}

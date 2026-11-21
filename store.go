@@ -98,7 +98,7 @@ type Store struct {
 }
 
 func journalHome() string {
-	if h := os.Getenv("JR_HOME"); h != "" {
+	if h := os.Getenv("JRNL_HOME"); h != "" {
 		return h
 	}
 	h, _ := os.UserHomeDir()
@@ -135,7 +135,7 @@ func Open(project string) (*Store, error) {
 		return nil, err
 	}
 	if v > schemaVersion {
-		return nil, fmt.Errorf("%s was written by a newer jr (schema %d, this jr knows %d)", dir, v, schemaVersion)
+		return nil, fmt.Errorf("%s was written by a newer jrnl (schema %d, this jrnl knows %d)", dir, v, schemaVersion)
 	}
 	if v > 0 {
 		// Bring an existing journal up to date before creating anything new.

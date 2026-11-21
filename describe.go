@@ -41,7 +41,7 @@ func (e *AI) Describe(a Asset) (string, error) {
 }
 
 func (e *AI) describeAudio(path string) (string, error) {
-	dir, err := os.MkdirTemp("", "jr-audio")
+	dir, err := os.MkdirTemp("", "jrnl-audio")
 	if err != nil {
 		return "", err
 	}
@@ -61,7 +61,7 @@ func (e *AI) describeAudio(path string) (string, error) {
 }
 
 func (e *AI) describeVideo(path string) (string, error) {
-	dir, err := os.MkdirTemp("", "jr-video")
+	dir, err := os.MkdirTemp("", "jrnl-video")
 	if err != nil {
 		return "", err
 	}
@@ -92,9 +92,9 @@ func (e *AI) describeVideo(path string) (string, error) {
 		// A failed transcript must not throw away a good caption.
 		var ns notSetUp
 		if t, err := transcribe(dir, wav); errors.As(err, &ns) {
-			// Not set up here; `jr doctor` says so.
+			// Not set up here; `jrnl doctor` says so.
 		} else if err != nil {
-			fmt.Fprintf(os.Stderr, "jr: video sound track not transcribed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "jrnl: video sound track not transcribed: %v\n", err)
 		} else if t != "" {
 			desc += "\n\nTranscript:\n" + t
 		}

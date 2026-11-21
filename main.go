@@ -1,4 +1,4 @@
-// jr is a per-project journal for coding agents. Entries live in SQLite;
+// jrnl is a per-project journal for coding agents. Entries live in SQLite;
 // markdown is only the input and output format.
 package main
 
@@ -17,9 +17,9 @@ import (
 	"time"
 )
 
-const usage = `jr — per-project journal
+const usage = `jrnl — per-project journal
 
-  jr add [flags] [body…]       add an entry (body from args or stdin); prints its ID
+  jrnl add [flags] [body…]     add an entry (body from args or stdin); prints its ID
       --title T                default: first line of body
       --kind K                 decision | bug | idea | todo | log | milestone | note (default note)
       --tag T                  repeatable
@@ -28,22 +28,22 @@ const usage = `jr — per-project journal
       --attach PATH[::CAPTION] image, video or audio, repeatable
       --at WHEN                when it happened (default now), e.g. yesterday
       --open                   track it as open until closed (todo entries start open)
-  jr close ID… [--note TEXT]   mark entries closed; the note is saved as an entry linked to them
-  jr reopen ID…                mark entries open again
-  jr show ID…                  print entries as markdown (ID prefix is enough)
-  jr list [filters]            newest first; --oldest for oldest first
-  jr search [filters] QUERY    keyword + semantic search over entries and attachment descriptions
+  jrnl close ID… [--note TEXT] mark entries closed; the note is saved as an entry linked to them
+  jrnl reopen ID…              mark entries open again
+  jrnl show ID…                print entries as markdown (ID prefix is enough)
+  jrnl list [filters]          newest first; --oldest for oldest first
+  jrnl search [filters] QUERY  keyword + semantic search over entries and attachment descriptions
       --newest | --oldest      the latest / the first matches, instead of the best
-  jr search --like FILE        find attachments whose description is like FILE's
-  jr sessions [filters]        recent sessions: when, how many entries, last title
-  jr stats [filters]           counts by kind, tag and author
-  jr summarize [filters]       summary of a period, citing entry IDs; saved and reused
+  jrnl search --like FILE      find attachments whose description is like FILE's
+  jrnl sessions [filters]      recent sessions: when, how many entries, last title
+  jrnl stats [filters]         counts by kind, tag and author
+  jrnl summarize [filters]     summary of a period, citing entry IDs; saved and reused
       --refresh                write it again even if nothing changed
-  jr reindex                   describe and embed whatever failed earlier
-  jr backup                    consistent copy of the database
-  jr where                     print this project's journal directory
-  jr doctor                    what is set up, and how to turn on the rest
-  jr version
+  jrnl reindex                 describe and embed whatever failed earlier
+  jrnl backup                  consistent copy of the database
+  jrnl where                   print this project's journal directory
+  jrnl doctor                  what is set up, and how to turn on the rest
+  jrnl version
 
 filters: --since WHEN  --until WHEN  --on WHEN
          --kind K  --tag T (repeatable, all must match)  --file NAME
@@ -55,8 +55,8 @@ WHEN, in local time: today, yesterday, 3 days ago, monday, last monday,
 --session last: the most recent session before this one.
 every command: --project P (default: from git remote, else directory name)
 
-jr works with no setup: entries, filters and keyword search. Optional parts,
-each a role in ~/.config/jr/config.toml (or JR_CONFIG) that names a provider
+jrnl works with no setup: entries, filters and keyword search. Optional parts,
+each a role in ~/.config/jrnl/config.toml (or JRNL_CONFIG) that names a provider
 and a model; see the README:
   [embed]             search by meaning, any OpenAI-compatible API
                       (default: Ollama on this machine, embeddinggemma-2:270m)
@@ -65,10 +65,10 @@ and a model; see the README:
   [media_embed]       search --like by look and sound (Cloudflare Workers AI);
                       without it, --like compares descriptions
   audio transcripts   parakeet-mlx through mise or uvx (Apple silicon)
-JR_<ROLE>_URL, _KEY and _MODEL (ROLE: EMBED, CHAT, RERANK) and JR_CHAT_EXTRA
-override the file. Keys come from variables, which jr also reads from
-JR_ENV_FILE (default ~/.config/jr/.env), such as a mounted 1Password Environment.
-jr doctor shows which are on. jr reindex indexes what was saved before setup.
+JRNL_<ROLE>_URL, _KEY and _MODEL (ROLE: EMBED, CHAT, RERANK) and JRNL_CHAT_EXTRA
+override the file. Keys come from variables, which jrnl also reads from
+JRNL_ENV_FILE (default ~/.config/jrnl/.env), such as a mounted 1Password Environment.
+jrnl doctor shows which are on. jrnl reindex indexes what was saved before setup.
 `
 
 func main() {
@@ -84,7 +84,7 @@ func main() {
 	}
 	name := os.Args[1]
 	if name == "version" || name == "--version" {
-		fmt.Println("jr", version)
+		fmt.Println("jrnl", version)
 		return
 	}
 	if name == "help" || name == "-h" || name == "--help" {
@@ -93,11 +93,11 @@ func main() {
 	}
 	cmd, ok := cmds[name]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "jr: unknown command %q\n\n%s", name, usage)
+		fmt.Fprintf(os.Stderr, "jrnl: unknown command %q\n\n%s", name, usage)
 		os.Exit(2)
 	}
 	if err := cmd(os.Args[2:]); err != nil {
-		fmt.Fprintln(os.Stderr, "jr:", err)
+		fmt.Fprintln(os.Stderr, "jrnl:", err)
 		os.Exit(1)
 	}
 }
@@ -250,13 +250,13 @@ func cmdAdd(args []string) error {
 	}
 
 	// The entry is saved first; describing and embedding happen after, outside
-	// the write lock, and anything that fails stays queued for `jr reindex`.
+	// the write lock, and anything that fails stays queued for `jrnl reindex`.
 	chunks := []Chunk{{Modality: "text"}}
 	for _, a := range e.Assets {
 		if m := a.Modality(); m != "" && a.Bytes <= maxRawBytes {
 			chunks = append(chunks, Chunk{Hash: a.Hash, Modality: m})
 		} else if m == "" {
-			fmt.Fprintf(os.Stderr, "jr: %s stored but not searchable by content (%s is not image, video or audio)\n", a.Name, a.Mime)
+			fmt.Fprintf(os.Stderr, "jrnl: %s stored but not searchable by content (%s is not image, video or audio)\n", a.Name, a.Mime)
 		}
 	}
 	if err := s.Insert(e, chunks); err != nil {
@@ -266,7 +266,7 @@ func cmdAdd(args []string) error {
 	// lead the caller to retry and create a duplicate.
 	fmt.Println(e.ID)
 	if ai, err := NewAI(); err != nil {
-		fmt.Fprintf(os.Stderr, "jr: saved without embedding (run `jr reindex` later): %v\n", err)
+		fmt.Fprintf(os.Stderr, "jrnl: saved without embedding (run `jrnl reindex` later): %v\n", err)
 	} else if _, err := process(s, ai, e.ID, true); err != nil {
 		return err
 	}
@@ -517,10 +517,10 @@ func cmdSearch(args []string) error {
 		if *like != "" {
 			return aiErr
 		}
-		// Without embeddings set up, keyword search is how jr works; hits are
+		// Without embeddings set up, keyword search is how jrnl works; hits are
 		// marked (keyword). Say so only when it finds nothing.
 		if !awaitingSetup(s, aiErr) {
-			fmt.Fprintf(os.Stderr, "jr: keyword search only: %v\n", aiErr)
+			fmt.Fprintf(os.Stderr, "jrnl: keyword search only: %v\n", aiErr)
 		}
 	}
 	hits, err := s.Search(q, qvec, embedder, modalities, *f, order)
@@ -528,7 +528,7 @@ func cmdSearch(args []string) error {
 		return err
 	}
 	if len(hits) == 0 && aiErr != nil && awaitingSetup(s, aiErr) {
-		fmt.Fprintln(os.Stderr, "jr: no keyword match; search by meaning is off (see `jr doctor`)")
+		fmt.Fprintln(os.Stderr, "jrnl: no keyword match; search by meaning is off (see `jrnl doctor`)")
 	}
 	if qvec != nil && q != "" && len(hits) > 1 {
 		k := min(*limit, 20)
@@ -737,14 +737,14 @@ func rerank(ai *AI, q string, hits []Hit, k int) []Hit {
 	}
 	order, err := ai.Rerank(q, items, k)
 	if errors.Is(err, errNoChat) {
-		return hits // not set up; `jr doctor` says so
+		return hits // not set up; `jrnl doctor` says so
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "jr: not reranked: %v\n", err)
+		fmt.Fprintf(os.Stderr, "jrnl: not reranked: %v\n", err)
 		return hits
 	}
 	if len(order) == 0 {
-		fmt.Fprintln(os.Stderr, "jr: no entry clearly answers this; showing the closest matches")
+		fmt.Fprintln(os.Stderr, "jrnl: no entry clearly answers this; showing the closest matches")
 		return hits
 	}
 	out := make([]Hit, 0, len(hits))
@@ -840,7 +840,7 @@ func setStatus(project string, prefixes []string, status, note string) error {
 	return nil
 }
 
-// cmdDoctor shows which optional parts of jr are on and how to turn on the
+// cmdDoctor shows which optional parts of jrnl are on and how to turn on the
 // rest. It never prints a credential, and it exits 0 when parts are off:
 // a journal with none of them is still a working journal.
 func cmdDoctor(args []string) error {
@@ -881,7 +881,7 @@ func cmdDoctor(args []string) error {
 	}
 	fmt.Printf("journal    %s: %d entries", s.dir, total)
 	if waiting > 0 {
-		fmt.Printf(", %d item(s) waiting for `jr reindex`", waiting)
+		fmt.Printf(", %d item(s) waiting for `jrnl reindex`", waiting)
 	}
 	fmt.Println()
 	row("basics", true, "add, list, show, keyword search, stats, close", "")
@@ -901,7 +901,7 @@ func cmdDoctor(args []string) error {
 		how += where("embed")
 	}
 	row("embedding", embedOn, "search by meaning, not only exact words", how)
-	how = "[chat] in " + configFile() + ", or JR_CHAT_URL, JR_CHAT_KEY, JR_CHAT_MODEL"
+	how = "[chat] in " + configFile() + ", or JRNL_CHAT_URL, JRNL_CHAT_KEY, JRNL_CHAT_MODEL"
 	if ai.chatErr == nil {
 		how = ai.chatModel + " at " + ai.chatURL + where("chat")
 	}
@@ -934,21 +934,21 @@ func cmdDoctor(args []string) error {
 	}
 	row("parakeet", parakeetOn, "transcripts of audio and video", how)
 	if waiting > 0 {
-		fmt.Println("\nAfter turning a part on, run `jr reindex` to index what was saved before.")
+		fmt.Println("\nAfter turning a part on, run `jrnl reindex` to index what was saved before.")
 	}
 	return nil
 }
 
 // embedStatus embeds one word, which works the same on every provider.
 func embedStatus(ai *AI) (bool, string) {
-	_, err := ai.Interactive(10 * time.Second).embedText([]string{"jr doctor"})
+	_, err := ai.Interactive(10 * time.Second).embedText([]string{"jrnl doctor"})
 	if err == nil {
 		return true, ai.embedModel + " at " + ai.embedURL
 	}
 	var down embedDown
 	if errors.As(err, &down) && !down.set {
 		return false, "install Ollama (ollama.com), run `ollama serve`, then `ollama pull " + ollamaModel +
-			"`; or set [embed] in config.toml (or JR_EMBED_URL, JR_EMBED_MODEL) for any OpenAI-compatible API"
+			"`; or set [embed] in config.toml (or JRNL_EMBED_URL, JRNL_EMBED_MODEL) for any OpenAI-compatible API"
 	}
 	return false, err.Error()
 }

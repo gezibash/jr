@@ -16,10 +16,10 @@ const (
 	// the part summaries are then combined. Keeps each call fast and inside
 	// the model's attention, whatever the period's length.
 	summaryPartChars = 40000
-	shortIDLen       = 14 // time + 4 random characters: unique, and jr show accepts it
+	shortIDLen       = 14 // time + 4 random characters: unique, and jrnl show accepts it
 )
 
-// Entries are cited by number, and jr turns the numbers into entry IDs.
+// Entries are cited by number, and jrnl turns the numbers into entry IDs.
 // Asked to copy 14-character IDs, Gemma listed 30-90 per bullet (about 8
 // tokens each), ran out of its 4,000-token budget on a 1,512-entry week, and
 // garbled some IDs.
@@ -51,7 +51,7 @@ func cmdSummarize(args []string) error {
 	ai, _ := NewAI()
 	sum, err := summarizeFilter(s, ai, g, *f, *refresh)
 	if errors.Is(err, errNoChat) {
-		return fmt.Errorf("summaries need a chat model, which is not set up (see `jr doctor`); `jr list` with the same filters shows the entries")
+		return fmt.Errorf("summaries need a chat model, which is not set up (see `jrnl doctor`); `jrnl list` with the same filters shows the entries")
 	}
 	if err != nil {
 		return err
@@ -148,7 +148,7 @@ func summarizeFilter(s *Store, ai *AI, g gitInfo, f Filter, refresh bool) (*Entr
 // 40,000-character parts made Gemma list them nearly one by one and hit its
 // 4,000-token limit in 2 of 5 parts; a day at a time keeps every call small.
 func summarizeByDay(s *Store, ai *AI, g gitInfo, f Filter, refresh bool, entries []Entry, days []string) (string, error) {
-	fmt.Fprintf(os.Stderr, "jr: summarizing %d entries day by day (%d days)\n", len(entries), len(days))
+	fmt.Fprintf(os.Stderr, "jrnl: summarizing %d entries day by day (%d days)\n", len(entries), len(days))
 	sums, errs := make([]*Entry, len(days)), make([]error, len(days))
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
@@ -195,7 +195,7 @@ func summarizeByDay(s *Store, ai *AI, g gitInfo, f Filter, refresh bool, entries
 	}
 	out, dropped := citeDays(out, dayIDs)
 	if dropped > 0 {
-		fmt.Fprintf(os.Stderr, "jr: removed %d citations that match no day\n", dropped)
+		fmt.Fprintf(os.Stderr, "jrnl: removed %d citations that match no day\n", dropped)
 	}
 	return out + "\n\nDetails by day: " + strings.Join(footer, ", ") + ".", nil
 }
@@ -296,7 +296,7 @@ func summarizeEntries(ai *AI, entries []Entry) (string, error) {
 	// Parts go 4 at a time: one after another, a 1,512-entry week took 253 s.
 	sums, errs := make([]string, len(parts)), make([]error, len(parts))
 	if len(parts) > 1 {
-		fmt.Fprintf(os.Stderr, "jr: summarizing %d entries in %d parts\n", len(entries), len(parts))
+		fmt.Fprintf(os.Stderr, "jrnl: summarizing %d entries in %d parts\n", len(entries), len(parts))
 	}
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
@@ -327,7 +327,7 @@ func summarizeEntries(ai *AI, entries []Entry) (string, error) {
 	}
 	out, dropped := citeIDs(out, entries)
 	if dropped > 0 {
-		fmt.Fprintf(os.Stderr, "jr: removed %d citations that match no entry in the period\n", dropped)
+		fmt.Fprintf(os.Stderr, "jrnl: removed %d citations that match no entry in the period\n", dropped)
 	}
 	return out, nil
 }
@@ -337,7 +337,7 @@ var (
 	reNumList   = regexp.MustCompile(`^\s*\d+(\s*[,;]\s*\d+)*\s*$`)
 )
 
-// citeIDs turns [12, 40] citations into entry IDs that jr show accepts,
+// citeIDs turns [12, 40] citations into entry IDs that jrnl show accepts,
 // keeps at most 5 per bullet, and drops numbers outside the entry list.
 // Brackets that aren't number lists are left alone.
 func citeIDs(text string, entries []Entry) (string, int) {

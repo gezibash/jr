@@ -13,9 +13,9 @@ type report struct {
 	lastErr                              error
 }
 
-// awaitingSetup reports whether err only means an optional part of jr has
+// awaitingSetup reports whether err only means an optional part of jrnl has
 // never been set up on this machine (for Ollama: not installed, and never
-// used by this journal). That work stays pending for `jr reindex`
+// used by this journal). That work stays pending for `jrnl reindex`
 // without a warning, so a fresh install runs quietly. A part that was set up
 // and then breaks still warns.
 func awaitingSetup(s *Store, err error) bool {
@@ -25,7 +25,7 @@ func awaitingSetup(s *Store, err error) bool {
 	case errors.As(err, &ns):
 		return true
 	case errors.As(err, &down):
-		// Chosen with JR_EMBED_URL, installed but not running, or used here
+		// Chosen with JRNL_EMBED_URL, installed but not running, or used here
 		// before: worth a warning.
 		_, installed := exec.LookPath("ollama")
 		return !down.set && installed != nil && !s.HasTextVectors()
@@ -73,7 +73,7 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 		case isPermanent(res.err):
 			err = s.SetDescribeError(res.a.Hash, res.err.Error())
 			r.failed++
-			fmt.Fprintf(os.Stderr, "jr: %s can't be described: %v\n", res.a.Name, res.err)
+			fmt.Fprintf(os.Stderr, "jrnl: %s can't be described: %v\n", res.a.Name, res.err)
 		case quiet && awaitingSetup(s, res.err):
 			r.waiting++
 			r.lastErr = res.err
@@ -81,7 +81,7 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 		default:
 			r.waiting++
 			r.lastErr = res.err
-			fmt.Fprintf(os.Stderr, "jr: %s not described yet (run `jr reindex` later): %v\n", res.a.Name, res.err)
+			fmt.Fprintf(os.Stderr, "jrnl: %s not described yet (run `jrnl reindex` later): %v\n", res.a.Name, res.err)
 		}
 		if err != nil {
 			return r, err
@@ -89,7 +89,7 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 	}
 
 	if hint {
-		fmt.Fprintln(os.Stderr, "jr: attachment saved; captions and transcripts need setup (see `jr doctor`)")
+		fmt.Fprintln(os.Stderr, "jrnl: attachment saved; captions and transcripts need setup (see `jrnl doctor`)")
 	}
 
 	ps, err := s.Pending(entryID, ai.embedID, ai.mediaID)
@@ -116,14 +116,14 @@ func process(s *Store, ai *AI, entryID string, quiet bool) (report, error) {
 				// Recorded so the next reindex skips it instead of retrying forever.
 				err = s.SetError(p.chunkID, errs[i].Error())
 				r.failed++
-				fmt.Fprintf(os.Stderr, "jr: %s can't be embedded: %v\n", p.label, errs[i])
+				fmt.Fprintf(os.Stderr, "jrnl: %s can't be embedded: %v\n", p.label, errs[i])
 			case quiet && awaitingSetup(s, errs[i]):
 				r.waiting++
 				r.lastErr = errs[i]
 			default:
 				r.waiting++
 				r.lastErr = errs[i]
-				fmt.Fprintf(os.Stderr, "jr: %s saved without embedding (run `jr reindex` later): %v\n", p.label, errs[i])
+				fmt.Fprintf(os.Stderr, "jrnl: %s saved without embedding (run `jrnl reindex` later): %v\n", p.label, errs[i])
 			}
 			if err != nil {
 				return r, err

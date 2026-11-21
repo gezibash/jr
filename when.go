@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// now is the reference time for relative dates. JR_NOW (RFC 3339) pins it,
+// now is the reference time for relative dates. JRNL_NOW (RFC 3339) pins it,
 // so tests and replays don't depend on the wall clock.
 func now() time.Time {
-	if s := os.Getenv("JR_NOW"); s != "" {
+	if s := os.Getenv("JRNL_NOW"); s != "" {
 		if t, err := time.Parse(time.RFC3339, s); err == nil {
 			return t.In(time.Local)
 		}
